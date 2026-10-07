@@ -1,0 +1,81 @@
+name: Bug Report
+description: Report a problem in Nvim
+type: 'bug'
+body:
+
+  - type: markdown
+    attributes:
+      value: |
+        *Before reporting:*
+        - Confirm the problem is reproducible in the [latest **nightly** release](https://github.com/neovim/neovim/releases/nightly).
+        - Run `make distclean` when encountering build issues.
+        - Search [existing issues](https://github.com/neovim/neovim/issues?q=is%3Aissue%20is%3Aopen%20type%3ABug) (including [closed](https://github.com/neovim/neovim/issues?q=is%3Aissue%20is%3Aclosed%20type%3ABug))
+        - Read the [FAQ](https://neovim.io/doc/user/faq/) and ["Reporting Problems" in CONTRIBUTING.md](https://github.com/neovim/neovim/blob/master/CONTRIBUTING.md#reporting-problems).
+        - Usage or "How to" questions will be closed, use [Discussions](https://github.com/neovim/neovim/discussions) or [stackoverflow](https://vi.stackexchange.com/) instead.
+  - type: textarea
+    attributes:
+      label: "Problem"
+      description: "Describe the problem concisely. May include logs, images, or videos."
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "Steps to reproduce"
+      description: |
+        - For build failures: list the exact steps including CMake flags (if any).
+        - If the bug is a crash/segfault, please include a [stacktrace](https://neovim.io/doc/user/dev_tools/#dev-tools-backtrace).
+        - For startup or shell-related problems: try `env -i TERM=ansi-256color "$(which nvim)"`.
+        - Use the provided [minimal reproduction template](https://github.com/neovim/neovim/blob/master/contrib/minimal.lua) to create a minimal configuration. After you fill it out with necessary information, run with `nvim --clean -u minimal.lua`.
+          - Do **not** include a package manager in the reproduction steps.
+      placeholder: |
+        nvim --clean
+        :edit foo
+        yiwp
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "Expected behavior"
+      description: "Describe the behavior you expect."
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: "Nvim version (nvim -v)"
+      placeholder: "0.6.0 commit db1b0ee3b30f"
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "Vim (not Nvim) behaves the same?"
+      description: "Does `vim -u DEFAULTS` have the same issue? Note the exact Vim version (`8.x.yyyy`)."
+      placeholder: "no, vim 7.3.432"
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "Operating system/version"
+      placeholder: "macOS 11.5"
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "Terminal name/version"
+      placeholder: "xterm 3.1"
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "$TERM environment variable"
+      placeholder: "xterm-256color"
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: "Installation"
+      description: "How did you install neovim: build from repo / system package manager / appimage / homebrew / snap / chocolatey / other (describe)?"
+      placeholder: "Arch User Repository (AUR)"
+    validations:
+      required: true

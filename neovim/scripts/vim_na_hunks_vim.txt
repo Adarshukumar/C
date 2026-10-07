@@ -1,0 +1,2 @@
+^func RunVimInTerminal(
+^func Test_python3_vim_bindeval(

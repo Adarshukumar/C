@@ -1,0 +1,133 @@
+/*
+ * This file is part of mpv.
+ *
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * mpv is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef MP_GL_USER_SHADERS_H
+#define MP_GL_USER_SHADERS_H
+
+#include "utils.h"
+#include "ra.h"
+
+#define SHADER_MAX_HOOKS 16
+#define SHADER_MAX_BINDS 16
+#define SHADER_MAX_PARAMS 16
+#define MAX_SZEXP_SIZE 32
+
+enum szexp_op {
+    SZEXP_OP_ADD,
+    SZEXP_OP_SUB,
+    SZEXP_OP_MUL,
+    SZEXP_OP_DIV,
+    SZEXP_OP_MOD,
+    SZEXP_OP_NOT,
+    SZEXP_OP_GT,
+    SZEXP_OP_LT,
+    SZEXP_OP_EQ,
+};
+
+enum szexp_tag {
+    SZEXP_END = 0, // End of an RPN expression
+    SZEXP_CONST, // Push a constant value onto the stack
+    SZEXP_VAR_W, // Get the width/height of a named texture (variable)
+    SZEXP_VAR_H,
+    SZEXP_VAR,   // Get the scalar value of a named parameter/enum member
+    SZEXP_OP2, // Pop two elements and push the result of a dyadic operation
+    SZEXP_OP1, // Pop one element and push the result of a monadic operation
+};
+
+struct szexp {
+    enum szexp_tag tag;
+    union {
+        float cval;
+        struct bstr varname;
+        enum szexp_op op;
+    } val;
+};
+
+struct compute_info {
+    bool active;
+    int block_w, block_h;     // Block size (each block corresponds to one WG)
+    int threads_w, threads_h; // How many threads form a working group
+    bool directly_writes;     // If true, shader is assumed to imageStore(out_image)
+};
+
+enum gl_user_shader_param_type {
+    GL_USER_SHADER_PARAM_UNKNOWN,
+    GL_USER_SHADER_PARAM_FLOAT,
+    GL_USER_SHADER_PARAM_INT,
+    GL_USER_SHADER_PARAM_DEFINE,
+};
+
+struct gl_user_shader_param {
+    struct bstr name;
+    struct bstr desc;
+    enum gl_user_shader_param_type type;
+    double value;
+    double initial;
+    double min;
+    double max;
+    bool has_min;
+    bool has_max;
+    struct bstr enum_body;
+};
+
+struct gl_user_shader_hook {
+    struct bstr pass_desc;
+    struct bstr hook_tex[SHADER_MAX_HOOKS];
+    struct bstr bind_tex[SHADER_MAX_BINDS];
+    struct gl_user_shader_param params[SHADER_MAX_PARAMS];
+    int num_params;
+    struct bstr save_tex;
+    struct bstr pass_body;
+    struct gl_transform offset;
+    bool align_offset;
+    struct szexp width[MAX_SZEXP_SIZE];
+    struct szexp height[MAX_SZEXP_SIZE];
+    struct szexp cond[MAX_SZEXP_SIZE];
+    int components;
+    struct compute_info compute;
+};
+
+struct gl_user_shader_tex {
+    struct bstr name;
+    struct ra_tex_params params;
+    // for video.c
+    struct ra_tex *tex;
+};
+
+// Parse the next shader block from `body`. The callbacks are invoked on every
+// valid shader block parsed.
+void parse_user_shader(struct mp_log *log, struct ra *ra, struct bstr shader,
+                       const char *path,
+                       void *priv,
+                       bool (*dohook)(void *p, const char *path,
+                                      const struct gl_user_shader_hook *hook),
+                       bool (*dotex)(void *p, struct gl_user_shader_tex tex));
+
+// Parse and validate a bstr value according to the param type and bounds.
+// Prints errors via the provided log. Returns true on success, false on error.
+bool parse_shader_param_value(struct mp_log *log, struct gl_user_shader_param *param,
+                              struct bstr val, double *out);
+
+int resolve_shader_enum_name(const struct gl_user_shader_param *param, struct bstr val);
+
+// Evaluate a szexp, given lookup functions for named textures and parameters.
+bool eval_szexpr(struct mp_log *log, void *priv,
+                 bool (*lookup_tex)(void *priv, struct bstr var, float size[2]),
+                 bool (*lookup_param)(void *priv, struct bstr var, float *out),
+                 struct szexp expr[MAX_SZEXP_SIZE], float *result);
+
+#endif

@@ -1,0 +1,703 @@
+*dev_arch.txt*          Nvim
+
+
+                            NVIM REFERENCE MANUAL
+
+
+How to develop Nvim, explanation of modules and subsystems    *dev-arch*
+
+Module-specific details are documented at the top of each module
+(`terminal.c`, `undo.c`, …). The top of each major module has (or should have)
+an overview in a comment at the top of its file.
+
+The purpose of this document is to give:
+
+1. an overview of how it all fits together
+2. how-to guides for common tasks such as:
+    - (TODO) deprecating public functions
+    - (TODO) adding a new public (API) function or (UI) event
+
+                                  Type |gO| to see the table of contents.
+
+==============================================================================
+Project layout: where things go                                   *dev-layout*
+
+C CODE
+
+- Nvim C code lives in `src/nvim/`.
+    - This includes third-party components which we have forked and fully
+      "own", meaning we no longer track the upstream. In particular: `vterm/`
+      and `tui/termkey/`.
+- Vendored third-party components live in `src/*`.
+    - `src/tee/` and `src/xxd/` have their own build files. They are shipped
+      with the Windows artifact to ensure those tools exists there.
+    - Other components like `src/cjson/` and `src/mpack/` are included with
+      Nvim itself. These vendored sources are synced from upstream, we do not
+      "own" them.
+
+See also "MAINTAIN.md".
+
+Generated C files use these filename conventions to hint their purpose:
+- `*.c`, `*.generated.c` - full C files, with all includes, etc.
+- `*.c.h` - parametrized C files, contain all necessary includes, but require
+  defining macros before actually using. Example: `typval_encode.c.h`
+- `*.h` - full headers, with all includes. Does not apply to `*.generated.h`.
+- `*.h.generated.h` - exported functions’ declarations.
+- `*.c.generated.h` - static functions’ declarations.
+
+
+LUA CODE
+
+Lua code lives in one of four places:
+
+1. Plugins! Not everything needs to live on `vim.*`. Plugins are the correct
+   model for non-essential functionality which (1) has "autoload" behavior,
+   (2) the user may disable or replace with a third-party plugin, (3) is
+   primarily user-facing, not an API.
+   - "Opt-out" plugins (activated on startup): `runtime/plugin/`
+   - "Opt-in" plugins (activated via `:packadd`): `runtime/pack/dist/opt/`
+   - Note: Update |standard-plugin-list|.
+   - Note: New plugins should place Lua modules in the shared "nvim"
+     namespace: `require('nvim.foo')`, not `require('foo')`.
+   - Examples:
+     - ✅ spellfile `runtime/lua/nvim/spellfile.lua`
+     - ✅ tutor
+   - Don't use these legacy plugins as examples (their modules should live
+     in `lua/nvim/x.lua`, not `lua/x.lua`):
+     - ❌ editorconfig.lua
+     - ❌ man.lua
+     - ❌ nvim.difftool
+     - ❌ nvim.tohtml
+     - ❌ nvim.undotree
+2. Stdlib: `runtime/lua/vim/`. Modules on `vim.*`, lazy-loaded (as opposed to
+   "Core" modules, see below).
+   - Examples: `vim.treesitter`, `vim.lpeg`.
+3. Core: `runtime/lua/vim/_core/`. Internal-only, compiled-in modules. May
+   directly interact with Nvim internals. Only available in main thread. See
+   |dev-lua-builtin| below.
+4. "Shared" core: `runtime/lua/vim/_core/shared.lua`. Pure Lua functions which
+   always are available. Used in the test runner, and worker threads/processes
+   launched from Nvim.
+
+The top-level `vim.` namespace is for fundamental Lua and editor features. Use
+submodules (`vim.foo`) for everything else (but avoid excessive "nesting"), or
+plugins (see above).
+
+Compatibility with Vim's `if_lua` is explicitly a non-goal.
+
+                                                             *dev-lua-builtin*
+Lua modules that are necessary even if VIMRUNTIME is invalid (generally, data
+structures and essential utilities), must be compiled into the `nvim` binary.
+There are two ways to do that:
+- if they are private, put the code file in `runtime/lua/vim/_core/`
+- if they are public, choose a new filepath in `runtime/lua/vim/`
+  and add it to VIM_MODULE_FILE in src/nvim/CMakeLists.txt.
+
+
+==============================================================================
+Data structures
+
+- StringBuilder
+- kvec or garray.c for dynamic lists / vectors (use StringBuilder for strings)
+
+Use `kvec.h` for most lists. When you absolutely need a linked list, use
+`src/nvim/lib/queue_defs.h` which defines an "intrusive" linked list.
+
+Buffer text is stored as a tree of line segments, defined in `src/nvim/memline.c`.
+The central idea is found in `ml_find_line`.
+
+Many of the editor concepts are defined as Lua data files:
+
+- Events (autocmds): src/nvim/auevents.lua
+- Ex (cmdline) commands: src/nvim/ex_cmds.lua
+- Options: src/nvim/options.lua
+- Vimscript functions: src/nvim/eval.lua
+  - Functions can be implemented in C (`f_foo` in eval/funcs.c), or in Lua
+    (set `func_lua` in eval.lua, implement in _core/vimfn.lua). Lua impl is
+    preferred, for performance and maintainability.
+    - VimScript callers go through `lua_wrapper` (typval <=> Object conversion).
+    - Lua callers (`vim.fn.foo()`) take a fast path in `nlua_call()` that calls
+      the Lua function directly, avoiding any conversion.
+- v: variables: src/nvim/vvars.lua
+
+==============================================================================
+Events                                                            *dev-events*
+
+The events historically called "autocmds", referred to here as "editor events"
+or simply "events", are high-level events for use by plugins, user config, and
+the Nvim editor. (There is an unrelated, low-level concept defined by the
+`event/defs.h#Event` struct, which is just a bag of data passed along the
+internal |event-loop|.)
+
+Where possible, new editor events should be implemented using `aucmd_defer()`
+(and where possible, old events migrate to this), so they are processed in
+a predictable manner, which avoids crashes. See |dev-new-event|.
+
+==============================================================================
+UI events                                                      *dev-ui-events*
+
+The long-term vision is that UI events are just another type of "editor event"
+(formerly known as "autocmds"). There is no real reason that we have separate
+types of user-facing or plugin-facing events. Events are events. Their
+"transport" is irrelevant and any event should be possible to emit over any
+transport (editor or RPC).
+
+Meanwhile the current situation is that UI events are a particular RPC event
+packaged in a generic `redraw` notification. They also can be listened to
+in-process via |vim.ui_attach()|.
+
+UI events are deferred to UIs, which implies a deepcopy of the UI event data.
+
+The source files most directly involved with UI events are:
+1. `src/nvim/ui.*`: calls handler functions of registered UI structs (independent from msgpack-rpc)
+2. `src/nvim/api/ui.*`: forwards messages over msgpack-rpc to remote UIs.
+
+UI events are defined in `src/nvim/api/ui_events.in.h` , this file is not
+compiled directly, rather it parsed by
+`src/gen/gen_api_ui_events.lua` which autogenerates wrapper
+functions used by the source files above. It also generates metadata
+accessible as `api_info().ui_events`.
+
+See commit d3a8e9217f39c59dd7762bd22a76b8bd03ca85ff for an example of adding
+a new UI event. Remember to bump NVIM_API_LEVEL if it wasn't already during
+this development cycle.
+
+Other references:
+- |msgpack-rpc|
+- |ui|
+- https://github.com/neovim/neovim/pull/3246
+- https://github.com/neovim/neovim/pull/18375
+- https://github.com/neovim/neovim/pull/21605
+
+==============================================================================
+State                                                              *dev-state*
+
+"Editor state" is represented by these (sometimes overlapping) concepts:
+
+- shada (`src/nvim/shada.c`): user data: registers, marks, …. Msgpack format.
+- sessions/views (`src/nvim/ex_session.c`): windows/layout, per-window
+  cursor/options, CWD, …. Vimscript format: commands, not merged data.
+  Overlaps shada for the buffer list and global variables.
+- context (`src/nvim/context.c`): |nvim_get_context()|. Interfaces shada and
+  other state; also in-memory per-cursor state (`kCtxVisual`, `kCtxMarks`, …)
+  for |multicursor|. Needs more thought.
+- scoped execution ("temporary state"): `ctx_switch()`, `vim._with()`,
+  |nvim_win_call()|, |nvim_buf_call()|, `cmdmod_T`. Temporary switches, not
+  snapshots. The C mechanisms overlap with each other; `vim._with()` is the
+  unified interface.
+- reentrancy protection: save/restore around nested execution. `InsState`,
+  `RedoState`.
+  - TODO: ad hoc pairs remain for typeahead (`tasave_T`), |v:event|, view
+    state, cmdline, with inconsistent nesting semantics (stack vs refcount vs
+    single-shot).
+
+LONG-TERM VISION(?): shada is the authority on all user-data state, sessions
+on layout state? New state kinds extend the shada schema instead of adding
+a format or an in-memory sidecar. Eliminate context.c?
+
+LUA FUNCTIONS ACROSS PROCESSES
+
+The test harness transfers Lua closures between Nvim instances
+(`test/functional/testnvim/exec_lua.lua`). This works ONLY between same-build
+instances (LuaJIT bytecode not portable across versions/builds) and only for
+trusted peers. Upvalues are limited to msgpack-able values (not
+function/userdata; tables lose metatables and identity).
+
+==============================================================================
+Filesystem                                                    *dev-filesystem*
+
+https://github.com/neovim/neovim/issues/36112 Path handling, especially
+separator chars ("/" vs "\"), is designed as follows: "/" separators are used
+every except at the "edges", i.e. the separator chars are coverted
+just-in-time, and only when absolutely needed. This is similar to how UTF-8
+encoding is used internally for all text, but buffers can read/write various
+encodings.
+
+P.S. Windows handles "/" separators just fine, except in rare cases. It'll be
+fine, don't worry. Just use "/", for god's sake!
+
+==============================================================================
+API
+
+                                                        *dev-api-fast*
+API functions and Vimscript "eval" functions may be marked as |api-fast| which
+means they are safe to call in Lua callbacks and other scenarios. A function
+CANNOT be marked as "fast" if it could trigger `os_breakcheck()`, which may
+"yield" the current execution and start a new execution of code not expecting
+this:
+- accidentally recursing into a function not expecting this.
+- changing (global) state without restoring it before returning to the
+  "yielded" callsite.
+
+In practice, this means any code that could trigger `os_breakcheck()` cannot
+be "fast". For example, commit 3940c435e405 fixed such a bug with
+`nvim__get_runtime` by explicitly disallowing `os_breakcheck()` via the
+`EW_NOBREAK` flag.
+
+Common examples of non-fast code: regexp matching, wildcard expansion,
+expression evaluation.
+
+==============================================================================
+Internal practices and patterns                          *dev-internals-howto*
+
+------------------------------------------------------------------------------
+Add a new excmd or vimfn ("f_xx")  function    *dev-new-excmd* *dev-new-vimfn*
+
+To implement an Ex cmd or f_xx function, choose from one of three ways (in
+order of preference):
+
+1. Full Lua: the implementation lives in entirely in Lua. This has
+   a performance benefit: the Vimscript <=> Lua bridge is skipped when the
+   `vim.fn.xx()` function is called from Lua. Examples:
+    - `f_hostname`
+2. Partial Lua: the C implementation calls `nlua_call_typval` or
+   `nlua_call_excmd`. (Or in rare cases: `nlua_exec` / `NLUA_EXEC_STATIC`).
+   Examples:
+   - `ex_log`
+   - `ex_lsp`
+   - `f_serverlist`
+3. Legacy way: implement the function entirely in C.
+   Examples:
+   - `f_chansend`
+   - `f_flatten`
+   - `f_searchpos`
+
+------------------------------------------------------------------------------
+Add a new event (autocmd)                                      *dev-new-event*
+
+To add a new editor event (autocmd):
+
+1. Register the event name in `src/nvim/auevents.lua`. If the event is
+   Nvim-only (not in Vim), also update the `nvim_specific` table.
+2. Fire the event, by one of these approaches:
+   - From C, use `aucmd_defer()` to fire deferred (safe, predictable). See
+     `do_markset_autocmd` for example.
+   - From Lua, use `vim.api.nvim_exec_autocmds()`.
+3. Define the |event-data| type (if any) in `runtime/lua/vim/_meta/events.lua`.
+4. Document the event in `runtime/doc/autocmd.txt`.
+
+==============================================================================
+The event-loop                                                    *event-loop*
+
+The internal, low-level, libuv event-loop (|luv-event-loop|) is used to
+schedule arbitrary work in a predictable way. One such obvious use-case for
+scheduling is deferred editor-events (autocmds). Another example is
+|job-control|.
+
+ASYNC EVENT SUPPORT
+
+One of the features Nvim added is the support for handling arbitrary
+asynchronous events, which can include:
+
+- RPC requests
+- job control callbacks
+- timers
+
+Nvim implements this functionality by entering another event loop while
+waiting for characters, so instead of: >py
+
+  def state_enter(on_state, data):
+    do
+      key = readkey()           # Read a key from the user
+    while on_state(data, key)   # Invoke callback for the current state
+
+the Nvim program loop is more like: >py
+
+  def state_enter(on_state, data):
+    do
+      event = read_next_event() # Read an event from the OS
+    while on_state(data, event) # Invoke callback for current state
+
+where `event` is something the operating system delivers to us, including (but
+not limited to) user input. The `read_next_event()` part is internally
+implemented by libuv, the platform layer used by Nvim.
+
+Since Nvim inherited its code from Vim, the states are not prepared to receive
+"arbitrary events", so we use a special key to represent those (When a state
+receives an "arbitrary event", it normally doesn't do anything other than
+update the screen).
+
+MAIN LOOP
+
+The `Loop` structure (which describes `main_loop`) abstracts multiple queues
+into one loop: >
+
+    uv_loop_t uv;
+    MultiQueue *events;
+    MultiQueue *thread_events;
+    MultiQueue *fast_events;
+
+`loop_poll_events` checks `Loop.uv` and `Loop.fast_events` whenever Nvim is
+idle, and also at `os_breakcheck` intervals.
+
+MultiQueue is cool because you can attach throw-away "child queues" trivially.
+For example `do_os_system()` does this (for every spawned process!) to
+automatically route events onto the `main_loop`: >
+
+    Process *proc = &uvproc.process;
+    MultiQueue *events = multiqueue_new_child(main_loop.events);
+    proc->events = events;
+
+
+NVIM LIFECYCLE
+
+How Nvim processes input.
+
+Consider a typical Vim-like editing session:
+
+01. Vim displays the welcome screen
+02. User types: `:`
+03. Vim enters command-line mode
+04. User types: `edit README.txt<CR>`
+05. Vim opens the file and returns to normal mode
+06. User types: `G`
+07. Vim navigates to the end of the file
+09. User types: `5`
+10. Vim enters count-pending mode
+11. User types: `d`
+12. Vim enters operator-pending mode
+13. User types: `w`
+14. Vim deletes 5 words
+15. User types: `g`
+16. Vim enters the "g command mode"
+17. User types: `g`
+18. Vim goes to the beginning of the file
+19. User types: `i`
+20. Vim enters insert mode
+21. User types: `word<ESC>`
+22. Vim inserts "word" at the beginning and returns to normal mode
+
+Note that we split user actions into sequences of inputs that change the state
+of the editor. While there's no documentation about a "g command mode" (step
+16), internally it is implemented similarly to "operator-pending mode".
+
+From this we can see that Vim has the behavior of an input-driven state machine
+(more specifically, a pushdown automaton since it requires a stack for
+transitioning back from states). Assuming each state has a callback responsible
+for handling keys, this pseudocode represents the main program loop: >py
+
+  def state_enter(state_callback, data):
+    do
+      key = readkey()                 # read a key from the user
+    while state_callback(data, key)   # invoke the callback for the current state
+<
+
+That is, each state is entered by calling `state_enter` and passing a
+state-specific callback and data. Here is a high-level pseudocode for a program
+that implements something like the workflow described above: >py
+
+  def main()
+    state_enter(normal_state, {}):
+
+  def normal_state(data, key):
+    if key == ':':
+      state_enter(command_line_state, {})
+    elif key == 'i':
+      state_enter(insert_state, {})
+    elif key == 'd':
+      state_enter(delete_operator_state, {})
+    elif key == 'g':
+      state_enter(g_command_state, {})
+    elif is_number(key):
+      state_enter(get_operator_count_state, {'count': key})
+    elif key == 'G'
+      jump_to_eof()
+    return true
+
+  def command_line_state(data, key):
+    if key == '<cr>':
+      if data['input']:
+        execute_ex_command(data['input'])
+      return false
+    elif key == '<esc>'
+      return false
+
+    if not data['input']:
+      data['input'] = ''
+
+    data['input'] += key
+    return true
+
+  def delete_operator_state(data, key):
+    count = data['count'] or 1
+    if key == 'w':
+      delete_word(count)
+    elif key == '$':
+      delete_to_eol(count)
+    return false  # return to normal mode
+
+  def g_command_state(data, key):
+    if key == 'g':
+      go_top()
+    elif key == 'v':
+      reselect()
+    return false  # return to normal mode
+
+  def get_operator_count_state(data, key):
+    if is_number(key):
+      data['count'] += key
+      return true
+    unshift_key(key)  # return key to the input buffer
+    state_enter(delete_operator_state, data)
+    return false
+
+  def insert_state(data, key):
+    if key == '<esc>':
+      return false  # exit insert mode
+    self_insert(key)
+    return true
+<
+
+The above gives an idea of how Nvim is organized internally. Some states like
+the `g_command_state` or `get_operator_count_state` do not have a dedicated
+`state_enter` callback, but are implicitly embedded into other states (this
+will change later as we continue the refactoring effort). To start reading the
+actual code, here's the recommended order:
+
+1. `state_enter()` function (state.c). This is the actual program loop,
+   note that a `VimState` structure is used, which contains function pointers
+   for the callback and state data.
+2. `main()` function (main.c). After all startup, `normal_enter` is called
+   at the end of function to enter normal mode.
+3. `normal_enter()` function (normal.c) is a small wrapper for setting
+   up the NormalState structure and calling `state_enter`.
+4. `normal_check()` function (normal.c) is called before each iteration of
+   normal mode.
+5. `normal_execute()` function (normal.c) is called when a key is read in normal
+   mode.
+
+The basic structure described for normal mode in 3, 4 and 5 is used for other
+modes managed by the `state_enter` loop:
+
+- command-line mode: `command_line_{enter,check,execute}()`(`ex_getln.c`)
+- insert mode: `insert_{enter,check,execute}()`(`insert.c`)
+- terminal mode: `terminal_{enter,execute}()`(`terminal.c`)
+
+IMPORTANT VARIABLES
+
+The current mode is stored in `State`.  The values it can have are `MODE_NORMAL`,
+`MODE_INSERT`, `MODE_CMDLINE`, and a few others.
+
+The current window is `curwin`.  The current buffer is `curbuf`.  These point
+to structures with the cursor position in the window, option values, the file
+name, etc.
+
+All the global variables are declared in `globals.h`.
+
+THE MAIN EVENT-LOOP
+
+The main loop is implemented in state_enter. The basic idea is that Nvim waits
+for the user to type a character and processes it until another character is
+needed.  Thus there are several places where Nvim waits for a character to be
+typed.  The `vgetc()` function is used for this.  It also handles mapping.
+
+Internal logic "stuffs" keys (readahead) only for a consumer on the current
+call stack: `exec_stuffed()`, or a nested reader it invokes.  See "Stuffing"
+in input.c. (This is simpler and more predictable than Vim, where a command
+may stuff chars, and let the main loop deal with them at some arbitrary future
+point, thus requiring global flags checked at the right time, scattered
+throughout the codebase.)
+
+What we consider the "Nvim event loop" is actually a wrapper around `uv_run` to
+handle both the `fast_events` queue and possibly (a suitable subset of) deferred
+events. Therefore "raw" `vim.uv.run()` is often not enough to yield from Lua;
+instead call `vim.wait(0)` and check its result.
+
+Updating the screen is mostly postponed until a command or a sequence of
+commands has finished.  The work is done by `update_screen()`, which calls
+`win_update()` for every window, which calls `win_line()` for every line.
+See the start of [drawscreen.c](drawscreen.c) for more explanations.
+
+COMMAND-LINE MODE
+
+When typing a `:`, `normal_cmd()` will call `getcmdline()` to obtain a line with
+an Ex command.  `getcmdline()` calls a loop that will handle each typed
+character.  It returns when hitting `<CR>` or `<Esc>` or some other character that
+ends the command line mode.
+
+EX COMMANDS
+
+Ex commands are handled by the function `do_cmdline()`.  It does the generic
+parsing of the `:` command line and calls `do_one_cmd()` for each separate
+command.  It also takes care of while loops.
+
+`do_one_cmd()` parses the range and generic arguments and puts them in the
+exarg_t and passes it to the function that handles the command.
+
+The `:` commands are listed in [ex_cmds.lua](ex_cmds.lua).
+
+NORMAL MODE COMMANDS
+
+The Normal mode commands are handled by the `normal_cmd()` function.  It also
+handles the optional count and an extra character for some commands.  These
+are passed in a `cmdarg_T` to the function that handles the command.
+
+There is a table `nv_cmds` in [normal.c](normal.c) which
+lists the first character of every
+command.  The second entry of each item is the name of the function that
+handles the command.
+
+INSERT MODE COMMANDS
+
+When doing an `i` or `a` command, `normal_cmd()` will call the `edit()` function.
+It contains a loop that waits for the next character and handles it.  It
+returns when leaving Insert mode.
+
+==============================================================================
+Multicursor                                       *dev-multicursor* *dev-cmdatom*
+
+Multicursor is essentially a bunch of extmarks that "cascade" the user action
+(|CmdAtom|) driven by the primary cursor.
+
+An "atom" is any user action, as a resolved ("elemental", post-mapping)
+keysequence, the same material ("redobuf") replayed by dot-repeat
+(|single-repeat|).  Whereas a macro is a series of meaningless characters
+whose meaning is context-dependent, assigned at the moment of execution, an
+atom scopes an input sequence to one, semantic, user action. Examples: "x" is
+captured as "dl", an insert session as `ciwfoo<Esc>`, a Visual-mode edit as
+`viweed`.
+
+CONCEPTS
+
+- ATOM: A repeatable unit of user input: the resolved keysequence, plus
+  structured fields (`CmdSpec`). Every user action emits a |CmdAtom| event.
+  - SPAN: Fragment of an Insert or Visual sequence, cascades but does not emit
+    a CmdAtom.
+  - FRAME: Scopes one MODE_NORMAL command (Normal, Visual, Select,
+    Op-pending). Non-MODE_NORMAL modes (Insert, Cmdline) are "sessions", not
+    "frames". All emit atoms.
+- CASCADE: Replay queued atoms at the "clock edge" at every cursor. Visual
+  edits cascade span-by-span each preceded by "gv"; the non-edit "tail"
+  dry-runs to display the selection.
+- COMPOSITE: An atom composed of subatoms (`CmdAtom.atoms`): a mapping/macro,
+  or a Visual sequence.
+- INSERT-SESSION: All changes from an insert-mode session, until <Esc>.
+  - INSERTION: An `Ins.start`..cursor "undo unit" within a session.
+  - INSERT-CASCADE: Replay an insert-session span-by-span as it is typed (each
+    span is packaged as a quasi-session: `i` + keys + `<Esc>`), via nested
+    `edit()`. Pending literal text is a PREVIEW until its span completes.
+- LOSSY: When capture lost part of a composite (payload with no capturing
+  atom, incomplete insert-session): `keys` cannot replay it, `lhs` can.
+- PAYLOAD: Keys a command reads interactively while executing: a search/Ex
+  cmdline (`d/pat<CR>`), `f{char}`, a mapping's `getchar()`.
+- REPLAY: Execute keys (dot-repeat, or atom).
+- VOID: When a pending (Visual) atom's keys were tainted/poisoned (by: mouse,
+  Select mode, a scroll that drags the cursor, …), thus not replayable.
+
+IMPLEMENTATION
+
+Capture happens at the `atom_xx()` hooks.
+- `prep_redo()` marks a redoable command (operators, `r`, `J`, `p`, …). Then
+  `atom_cmd_end()` takes the final redobuff as the atom, (including
+  payloads, e.g. `d/pat<CR>`).  Prep-exempt commands (yank, `D`, folds) are
+  reconstructed instead, in `atom_capture_op()`.
+- `atom_cmd_start()` delimits a command in `normal_execute()`.  Everything not
+  covered above is decided here (motions, jumps, scrolls, mouse).
+- `atom_ins_start()` delimits an insert session.
+- `atom_map_start()`, `atom_macro_start()` delimit a composite.
+- `atom_visual_end()` completes the pending Visual atom, `viweex` => `viweed`.
+  <Esc> discards it; non-replayable commands VOID it.
+- `atom_cmdline_set()` gets an invoked cmdline payload (e.g. `/pat<CR>` is
+  a motion atom, `:cnext<CR>` is an "excmd" atom.)
+
+DOT-REPEAT
+
+The redo buffer is the pending change as a `CmdSpec` (`RedoState`): the
+`["x][count]` prefix is structured fields set by `prep_redo()`, and the
+command body is bytes appended during execution by the `redo_append_xx()`
+family (Vim's `AppendToRedobuff*`).  Consumers rebuild the keysequence at
+the boundaries (`redo_keys()`, `start_redo()`, `atom_from_redo()`).
+
+THE CASCADE
+
+Cursors are extmarks with associated `Context` data (`mc_cursors`). The
+extmark is authoritative: it follows edits, and user code may delete cursors
+by deleting their extmarks. Cursor-local state is swapped-in on replay, so
+each cursor reads/writes its own registers, Visual area and change marks.
+
+CmdAtoms queued for cascade (`g_atoms`) are replayed at every cursor on the
+"clock edge": the completion of a toplevel `normal_execute()`.  While
+a mapping is executing (its keys are still in typebuf) the edge is deferred
+(subatoms queue/accumulate).
+
+Undo is buffer-global and applied in bulk.  Each cascade adds one undo state,
+and undo/redo itself is not cascaded.
+
+The insert-cascade PREVIEW/COMMIT model (why text is previewed instead of
+replayed) is documented at `mc_ins_span`.  Sessions that cannot insert-cascade
+(count `3iZ`, Replace mode, blockwise `CTRL-V c`) are captured at <Esc>.
+- See `CmdAtomType` and `atom_key_class()` to understand how input is
+  classified to decide whether and how it can be replayed.
+
+RHS VS LHS
+
+Multicursor "cascade" is meaningful only for edits and motions. Example: while
+you have multicursors placed, you may want to scroll or switch to a window
+temporarily; it would be a chore if you had to exit multicursor before doing
+those actions.
+
+Thus, cascade prefers to replay, skip, or partially-apply RHS (the resolved
+`keys`) instead of naively replaying LHS (the unresolved, remap-enabled, user
+input). In general, RHS "degrades gracefully" by doing LESS (and a single "u"
+reverts it), whereas LHS worst-case is unbounded (it fails by doing MORE; "u"
+cannot revert its side-effects).
+
+LHS may resolve to arbitrary Excmds/Lua that make sense at the primary, but
+not at cascade. Whereas RHS classification allows multicursor to skip (or
+partially apply) a user action that involves unreplayable subatoms. Similar to
+how insert-completion does not show a menu at every cursor, but it does
+cascade.
+
+Examples where RHS replay behaves better than LHS:
+
+- Performance:
+  - LHS replays the entire callback per-cursor, which can be very slow if it
+    involves treesitter queries, LSP requests, etc.
+  - RHS replays only the resolved normal commands.
+- Viewport-relative commands (zt/<C-d>/H/L/… in mapping):
+  - LHS cascade is nonsense because cursors may be offscreen.
+- Jumps / global ops (absolute, not cursor-relative):
+  - `nnoremap X Gdd`: RHS replays only dd, per cursor.
+  - `nnoremap <Down> ]C`: LHS (follow-mode) moves each cursor to its neighbor.
+  - `nnoremap u u`: LHS would undo N times.
+- Editor state outside of current buffer:
+  - `nnoremap ]x <Cmd>cnext<CR>x`:
+    - LHS is nonsense.
+    - RHS: `:cnext` runs once at primary; only `x` cascades.
+  - `nnoremap X <Cmd>set wrap!<CR>x`:
+    - LHS toggles N times, the result depends on N.
+    - RHS does not cascade the `<Cmd>`.
+
+Examples where LHS replay behaves better (and RHS replay is wrong):
+
+- Conditional mappings, e.g. `nnoremap X <Cmd>if getline('.') =~ 'foo' \| normal! dd \| endif<CR>`.
+  - Unblocked by `setrepeat()` API: https://github.com/neovim/neovim/issues/42069
+
+RENDERING
+
+Display is owned by `runtime/lua/vim/_core/mcursor.lua`. The C core maintains
+the model, as extmarks:
+
+- "nvim.multicursor": the tracking marks (cursor positions).
+- "nvim.multicursor.cursor": selection-END display cursors, during Visual mode
+  (each cursor displays at its own selection end).  Consumers (UIs) that
+  display cursors use these positions
+  while any exist, instead of the tracking marks.
+- "nvim.multicursor.visual": the pending selection ranges.
+
+GUI SUPPORT
+
+A GUI gets a working display for free, via cell highlights. If it wants to
+draw "real" cursors, it is expected to:
+- receive positions via the `win_extmark` UI event: the tracking marks are
+  ui_watched, so visible cursor positions are pushed per-redraw.  (Known
+  issue: win_extmark does not give a removal signal; re-query when in doubt.)
+- or query the namespaces above with |nvim_buf_get_extmarks()|; prefer the
+  "nvim.multicursor.cursor" positions while any exist (in-progress Visual
+  selection).
+- render selections from "nvim.multicursor.visual", or simply keep their
+  |hl-MCursorVisual| grid highlights.
+
+==============================================================================
+
+vim:tw=78:ts=8:sw=4:et:ft=help:norl:

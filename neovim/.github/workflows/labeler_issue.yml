@@ -1,0 +1,52 @@
+name: "label-issue"
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  labeler:
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: check issue title
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const title = context.payload.issue.title;
+            const titleSplit = title.split(/\b/).map(e => e.toLowerCase());
+            const keywords = [
+              'api',
+              'image',
+              'lsp',
+              'multicursor',
+              'treesitter',
+              'ui',
+              'ui2'
+            ];
+            var labels = new Set();
+
+            for (const keyword of keywords) {
+              if (titleSplit.includes(keyword)) {
+                labels.add(keyword)
+              }
+            }
+
+            // Special cases.
+            if (titleSplit.includes('vim.pack')) {
+              labels.add('packages')
+            }
+            if (titleSplit.includes('cmdatom')) {
+              labels.add('multicursor')
+            }
+
+            if (labels.size !== 0) {
+              github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: Array.from(labels)
+              })
+            }

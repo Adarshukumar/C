@@ -1,0 +1,34 @@
+{
+  "$comment": "Keep LuaLS settings under Lua so EmmyLua ignores them.",
+  "Lua": {
+    "runtime": {
+      "version": "LuaJIT"
+    },
+    "workspace": {
+      "ignoreDir": [
+        "/lua/vim/async.lua",
+        ".deps",
+        "build"
+      ],
+      "ignoreGlobs": [
+        "test/**/fixtures/**"
+      ],
+      "preloadFileSize": 1000,
+      "checkThirdParty": "Disable"
+    },
+    "diagnostics": {
+      "groupFileStatus": {
+        "strict": "Opened",
+        "strong": "Opened"
+      },
+      "groupSeverity": {
+        "strong": "Warning",
+        "strict": "Warning"
+      },
+      "unusedLocalExclude": [ "_*" ],
+      "disable": [
+        "luadoc-miss-see-name"
+      ]
+    }
+  }
+}

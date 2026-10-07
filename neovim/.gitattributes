@@ -1,0 +1,18 @@
+*.h.in          linguist-language=C
+*.c.in          linguist-language=C
+*CMakeLists.txt linguist-language=CMake
+
+runtime/doc/*   linguist-documentation
+runtime/doc/builtin.txt linguist-generated
+
+# api.gen.lua, vimfn.gen.lua, etc.
+runtime/lua/vim/_meta/*.gen.lua linguist-generated
+
+src/xdiff/**    linguist-vendored
+src/cjson/**    linguist-vendored
+src/unicode/**  linguist-vendored
+
+.github/    export-ignore
+
+runtime/doc/*.txt diff=helphelp
+runtime/pack/dist/opt/*/doc/*.txt diff=helphelp

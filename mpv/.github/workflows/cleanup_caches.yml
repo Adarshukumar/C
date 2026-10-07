@@ -1,0 +1,66 @@
+name: Cleanup caches
+
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+
+jobs:
+  cache:
+    runs-on: ubuntu-slim
+    steps:
+      - run: |
+          set -o pipefail
+          gh cache list -L 1000 --json id,key,ref -S last_accessed_at -O desc > caches.json
+
+          # Resolve the state of every pull request that owns a cache.
+          for pr in $(jq -r '.[].ref | select(test("^refs/pull/[0-9]+/merge$")) |
+                             split("/")[2]' caches.json | sort -u); do
+            jq -n --arg pr "$pr" --arg state "$(gh pr view $pr --json state --jq .state)" \
+                  '{($pr): $state}'
+          done | jq -s 'add // {}' > prs.json
+
+          jq -r --slurpfile prs prs.json --arg default "$DEFAULT_REF" '
+            $prs[0] as $state |
+
+            # Group caches by kind, dropping the timestamp or content hash
+            # that every save appends to the key.
+            def family: if startswith("msys2-") then "msys2"
+                        elif test("-[0-9]+$") then "ccache"
+                        else "other" end;
+            def group:  if family == "msys2" then sub("-(files|state):.*$"; "")
+                        else sub("-[0-9]+$"; "") end;
+
+            [ .[] | . + { family: (.key | family),
+                          group:  (.key | group),
+                          pr:     (.ref | if test("^refs/pull/[0-9]+/merge$")
+                                          then split("/")[2] else null end) } ]
+            | map(select(.family != "other")) as $all
+
+            # Caches of merged or closed pull requests, and msys2 caches
+            # outside the default branch, which every ref restores from.
+            | ( $all | map(select(
+                  (.pr != null and $state[.pr] != "OPEN") or
+                  (.family == "msys2" and .ref != $default)
+                )) ) as $dead
+
+            # Of the rest only the newest cache of each kind per ref is used.
+            | ( ($all - $dead) | group_by([.ref, .group]) | map(.[1:]) | add // [] ) as $superseded
+
+            | ($dead + $superseded)[] | "\(.id)\t\(.ref)\t\(.key)"
+          ' caches.json |
+          while IFS=$'\t' read -r id ref key; do
+            echo "deleting $ref $key"
+            gh cache delete "$id"
+          done
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}

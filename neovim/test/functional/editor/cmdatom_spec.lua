@@ -1,0 +1,2078 @@
+-- Tests for atom capture: the CmdAtom event, and dot-repeat of whole insert sessions.
+
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
+local Screen = require('test.functional.ui.screen')
+local t_atom = require('test.functional.editor.atom_testutil')
+
+local describe, it, before_each = t.describe, t.it, t.before_each
+local retry = t.retry
+local clear = n.clear
+local command = n.command
+local exec = n.exec
+local feed = n.feed
+local fn = n.fn
+local eq = t.eq
+local eq_partial = t.eq_partial
+local api = n.api
+local get_lines = t_atom.get_lines
+local k = t_atom.k
+local atoms_start = t_atom.atoms_start
+local atoms = t_atom.atoms
+local atoms_tail = t_atom.atoms_tail
+local atom_last = t_atom.atom_last
+local pick = t.pick
+local subatoms = t_atom.subatoms
+
+describe('dot-repeat', function()
+  before_each(clear)
+
+  it('replays insert-mode cursor-moves (the whole session)', function()
+    fn.setline(1, { 'one', 'two' })
+    feed('iab<Left>c<Esc>')
+    eq({ 'acbone', 'two' }, get_lines())
+    -- The ". register and undo still restart at the cursor-move, like Vim.
+    eq('c', fn.getreg('.'))
+    feed('u')
+    eq({ 'abone', 'two' }, get_lines())
+    feed('<C-r>')
+    -- "." re-executes the whole session, cursor-move included.
+    feed('j0.')
+    eq({ 'acbone', 'acbtwo' }, get_lines())
+    -- An absolute jump (<C-Home>) still restarts the capture: "." replays
+    -- only the post-jump insert.
+    feed('ggAxy<C-Home>z<Esc>')
+    eq({ 'zacbonexy', 'acbtwo' }, get_lines())
+    eq('z', fn.getreg('.'))
+    feed('j0.')
+    eq({ 'zacbonexy', 'zacbtwo' }, get_lines())
+    -- Vim's repeat-only-the-tail behavior is a mapping away (documented in
+    -- vim_diff.txt): i_CTRL-O re-entry restarts the capture.
+    command('inoremap <Left> <C-o><Left>')
+    feed('ggiab<Left>c<Esc>')
+    eq({ 'acbzacbonexy', 'zacbtwo' }, get_lines())
+    feed('j0.')
+    eq({ 'acbzacbonexy', 'czacbtwo' }, get_lines())
+  end)
+
+  it('failing mid-selection ends Visual-mode #41896', function()
+    fn.setline(1, { '1', '2', '3' })
+    feed('<C-V>jI1<Esc>j.j.') -- The 2nd "." fails: "j" on the last line.
+    eq({ '11', '112', '13' }, get_lines())
+    eq('n', fn.mode(1))
+    feed('k0.') -- The failed "." did not replace the last change.
+    eq({ '11', '1112', '113' }, get_lines())
+    -- Error (E20) instead of beep. ModeChanged fires after the error, not inside emsg().
+    command('autocmd ModeChanged V:n echomsg "ModeChanged"')
+    for _, eb in ipairs({ 'noerrorbells', 'errorbells' }) do
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'one', 'two' })
+      feed('ggmajV`a~')
+      command(('set %s | delmarks a | messages clear'):format(eb))
+      feed('.')
+      eq({ 'ONE', 'TWO' }, get_lines(), eb)
+      eq('n', fn.mode(1))
+      eq('\nE20: Mark not set\nModeChanged', fn.execute('messages'))
+    end
+    -- A macro or mapping still stops at the failed motion, in Visual mode (map-error).
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'one', 'two', 'three' })
+    fn.setreg('q', 'Vjd')
+    command('nnoremap Q Vjd')
+    for _, keys in ipairs({ 'gg2@q', 'Q' }) do
+      feed(keys)
+      eq({ 'three' }, get_lines(), keys)
+      eq('V', fn.mode(1))
+      feed('<Esc>')
+    end
+  end)
+
+  it('of a visual op does not churn showcmd', function()
+    local screen = Screen.new(40, 8, { ext_messages = true })
+    command('set showcmd')
+    fn.setline(1, { 'foo bar', 'longword two' })
+    feed('gg0viWgU')
+    feed('2gg0')
+    screen:expect({ any = '%^longword' })
+    local updates = {}
+    function screen:_handle_msg_showcmd(msg)
+      local text = table.concat(vim.tbl_map(function(chunk)
+        return chunk[2]
+      end, msg))
+      if text ~= '' then
+        updates[#updates + 1] = text
+      end
+      self.showcmd = msg
+    end
+    feed('.')
+    retry(nil, nil, function()
+      eq({ 'FOO bar', 'LONGWORD two' }, get_lines())
+    end)
+    screen:sleep(50)
+    -- Stuffed (replayed) keys must not display in 'showcmd': ext_messages UIs redraw per showcmd
+    -- change, which would paint the replay's transient states (its in-progress Visual selection).
+    eq(
+      {},
+      vim.tbl_filter(function(s)
+        return s:find('[UW]') ~= nil
+      end, updates)
+    )
+  end)
+end)
+
+describe('CmdAtom', function()
+  before_each(clear)
+
+  describe('composite', function()
+    it('motion mapping', function()
+      command('nnoremap j gj')
+      fn.setline(1, { 'a1', 'b2', 'c3', 'd4', 'e5' })
+      feed('gg')
+      atoms_start()
+      feed('3j')
+      eq(4, fn.line('.'))
+      local ev = atom_last()
+      eq_partial({ type = 'motion', lhs = 'j', keys = '3gj', count = 3 }, ev)
+      -- The "," repeat recipe: replaying the KEYS verbatim repeats the count.
+      feed('gg')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+      eq(4, fn.line('.'))
+      -- Multi-command mapping: the pre-typed count lands in the FIRST folded
+      -- command; the folded atom itself has no single count.
+      command('nnoremap <F6> xw')
+      fn.setline(1, { 'abcdef ghi', 'jkl' })
+      feed('gg0')
+      feed('3<F6>')
+      ev = atom_last()
+      eq({ type = 'mapping', lhs = k('<F6>') }, pick(ev, 'type', 'count', 'lhs'))
+      -- Only the composite carries the mapping's LHS: a subatom is its own input.
+      eq_partial({ keys = '3dl', count = 3, lhs = '3dl' }, ev.atoms[1])
+      -- "." repeats the mapping's EDIT as ONE atom, labeled "." (not "<F6>").
+      local before = #atoms()
+      feed('.')
+      eq(before + 1, #atoms())
+      eq_partial({ type = 'operator', keys = '3dl', lhs = '.' }, atom_last())
+    end)
+
+    it('Lua mapping (e.g. "]q" default)', function()
+      -- Default "]q" mapping: a Lua callback with unknown keys. Still a user action, emits an atom.
+      n.exec_lua([[
+        vim.keymap.set('n', ']q', function()
+          vim.cmd({ cmd = 'cnext', count = vim.v.count1 })
+        end, { desc = ':cnext' })
+      ]])
+      fn.setline(1, { 'aaa', 'bbb', 'ccc' })
+      local bufnr = api.nvim_get_current_buf()
+      fn.setqflist({ { bufnr = bufnr, lnum = 1 }, { bufnr = bufnr, lnum = 3 } })
+      command('cfirst')
+      atoms_start()
+      feed(']q')
+      eq(3, fn.line('.')) -- The mapping did run (:cnext).
+      eq(
+        { type = 'mapping', lhs = ']q', changed = false },
+        pick(atom_last(), 'type', 'lhs', 'keys', 'changed')
+      )
+      -- Empty `keys` mapping that edits via API: `changed=true`.
+      n.exec_lua([[
+        vim.keymap.set('n', ',e', function()
+          vim.api.nvim_buf_set_lines(0, 0, 0, false, { 'NEW' })
+        end)
+      ]])
+      feed(',e')
+      eq({ lhs = ',e', changed = true }, pick(atom_last(), 'keys', 'lhs', 'changed'))
+
+      -- "<Cmd>" is opaque too, but unlike a Lua callback its command is text (like a ":" mapping).
+      command('nnoremap ,c <Cmd>call setline(1, "N" . v:count)<CR>')
+      feed('3,c')
+      local cmdev = atom_last()
+      eq_partial({
+        type = 'excmd',
+        lhs = ',c',
+        keys = k('3<Cmd>call setline(1, "N" . v:count)<NL>'),
+        text = 'call setline(1, "N" . v:count)',
+        count = 3,
+        changed = true,
+      }, cmdev)
+      -- Those keys replay: the count must survive, since "<Cmd>" reads v:count.
+      eq('N3', fn.getline(1))
+      fn.setline(1, 'reset')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(cmdev.keys))
+      eq('N3', fn.getline(1))
+      -- "<Cmd>" text is raw, a trailing "0" is not CTRL-V escaped (as for a ":" cmdline).
+      command([[nnoremap ,z <Cmd>call setline(1, 'Z') <Bar> let g:z = 10<CR>]])
+      feed(',z')
+      eq(k([[<Cmd>call setline(1, 'Z') | let g:z = 10<NL>]]), atom_last().keys)
+
+      -- <expr> mapping that returns a "<Cmd>lua …<CR>" (dot-repeat idiom #41387) captures the same
+      -- way: the constructed command is the atom.
+      n.exec_lua([[
+        vim.keymap.set('n', ',x', function()
+          return '<Cmd>call setline(1, "E" . v:count1)<CR>'
+        end, { expr = true })
+      ]])
+      feed('2,x')
+      cmdev = atom_last()
+      eq_partial({
+        type = 'excmd',
+        lhs = ',x',
+        keys = k('2<Cmd>call setline(1, "E" . v:count1)<NL>'),
+        count = 2,
+      }, cmdev)
+      fn.setline(1, 'reset')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(cmdev.keys))
+      eq('E2', fn.getline(1))
+
+      -- Opaque key that changes nothing is invisible: mid-selection it must not void the pending
+      -- visual atom, which would void its per-cursor extents.
+      command('vnoremap ,n <Cmd>call execute("")<CR>')
+      fn.setline(1, { 'aaa bbb' })
+      feed('gg0viw,nd')
+      eq(' bbb', fn.getline(1))
+      eq_partial({ type = 'visual', keys = 'viwd' }, atom_last())
+    end)
+
+    it('<expr> mapping: EXPRESSION input vs EXECUTION input #41665', function()
+      atoms_start()
+      for _, reader in ipairs({ 'getcharstr', 'input' }) do
+        n.exec_lua(function(reader_)
+          _G._log = {}
+          vim.keymap.set('o', 's', function()
+            local input = reader_ == 'input' and vim.fn.input('') or vim.fn.getcharstr()
+            local data = { input, vim.v.count1 }
+            return ('<Cmd>lua table.insert(_G._log, %s)<CR>'):format(vim.inspect(data))
+          end, { expr = true })
+        end, reader)
+
+        local input = reader == 'input' and 'e<CR>' or 'e'
+        -- Placement of [count] should not change the behavior. #41665
+        for _, prefix in ipairs({ '2d', 'd2' }) do
+          feed(('%ss%s'):format(prefix, input))
+          eq_partial({
+            type = 'operator',
+            operator = 'd',
+            count = 2,
+            lhs = k(('ds%s'):format(input)),
+            keys = k('2d<Cmd>lua table.insert(_G._log, { "e", 2 })<NL>'),
+          }, atom_last())
+        end
+        eq({ { 'e', 2 }, { 'e', 2 } }, n.exec_lua('return _G._log'))
+      end
+
+      -- expr EVALUATION gets "e" from getcharstr(), which the expr-mapping RETURNS, thus hardcoding
+      -- it into `keys` (not APPENDED by the capture engine).
+      -- Mapping EXECUTION getcharstr() consumes "q" _when executed_, thus "q" is APPENDED to `keys`.
+      n.exec_lua([[
+        vim.keymap.set('o', 's', function()
+          return ('<Cmd>let g:read_input = %q . getcharstr()<CR>'):format(vim.fn.getcharstr())
+        end, { expr = true })
+      ]])
+      for _, keys in ipairs({ '2dseq', 'd2seq' }) do
+        feed(keys)
+        local ev = atom_last()
+        eq_partial(
+          { lhs = 'dseq', keys = k('2d<Cmd>let g:read_input = "e" . getcharstr()<NL>q') },
+          ev
+        )
+        eq('eq', api.nvim_get_var('read_input'))
+        api.nvim_set_var('read_input', '')
+        api.nvim_feedkeys(ev.keys, 'nx', false)
+        eq('eq', api.nvim_get_var('read_input'))
+      end
+    end)
+
+    it('mapping that enters :terminal mode', function()
+      -- Fake picker/fuzzy-finder: a mapping that opens a :terminal UI (like fzf-lua).
+      -- Its composite ends when :terminal is entered.
+      n.exec_lua(function(prg)
+        vim.keymap.set('n', ',f', function()
+          vim.cmd('enew')
+          vim.fn.jobstart({ prg, 'INTERACT' }, { term = true })
+          vim.cmd.startinsert()
+        end)
+      end, n.testprg('shell-test'))
+      atoms_start()
+      feed(',f')
+      n.poke_eventloop()
+      eq(
+        { buftype = 'terminal', mode = 't' },
+        n.exec_lua('return { buftype = vim.bo.buftype, mode = vim.fn.mode(1) }')
+      )
+      feed('exit<CR>') -- Terminal-mode input: no atoms.
+      n.poke_eventloop()
+      feed([[<C-\><C-N>]])
+      feed('gg')
+      eq({
+        { type = 'mapping', lhs = ',f' },
+        { type = 'jump', lhs = 'gg', keys = 'gg' },
+      }, atoms_tail(2, 'type', 'lhs', 'keys'))
+    end)
+
+    it('simple mapping (single command) "unwraps" to the underlying type', function()
+      command('nnoremap ,d dw')
+      fn.setline(1, { 'one two aa bb cc dd' })
+      feed('gg0')
+      atoms_start()
+      feed(',d')
+      eq({ 'two aa bb cc dd' }, get_lines())
+      local evs = atoms()
+      eq(1, #evs)
+      -- Inapplicable fields (count/reg/arg/motionforce/text/atoms) are omitted.
+      eq({
+        type = 'operator', -- Unwrapped.
+        keys = 'dw',
+        operator = 'd',
+        cmd = 'w',
+        changed = true,
+        lhs = ',d',
+        moved = false, -- "dw" deletes at the cursor; does not move!
+        pos = { 1, 0 }, -- Original cursor position.
+        undoseq = 2, -- Undo state after the change; decreases on undo (see |restore-undo-cursor|).
+      }, evs[#evs])
+      -- Count/register are captured; one event per occurrence.
+      feed('"z2dw')
+      feed('"z2dw')
+      evs = atoms()
+      eq_partial({ keys = '"z2dw', count = 2, reg = 'z' }, evs[#evs])
+      -- Identical occurrences, except `undoseq`: each edit is a new undo state.
+      evs[#evs].undoseq, evs[#evs - 1].undoseq = nil, nil
+      eq(evs[#evs - 1], evs[#evs])
+    end)
+
+    it('complex mapping with edits/motions emits one type=mapping atom', function()
+      -- Split the line at the cursor, ending at the EOL of the first half.
+      command('nnoremap gj i<c-j><esc>k$')
+      fn.setline(1, { 'aaa bbb' })
+      feed('gg04l')
+      atoms_start()
+      feed('gj')
+      eq({ 'aaa ', 'bbb' }, get_lines())
+      -- The mapping commands (insert-session, k, $) accumulate and fold into one CmdAtom, labeled
+      -- with the user-typed LHS; the resolved keys remain the (replayable) payload.
+      local evs = atoms()
+      eq(1, #evs)
+      eq_partial(
+        { type = 'mapping', lhs = 'gj', keys = k('1i<NL><Esc>k$'), changed = true },
+        evs[1]
+      )
+      -- The sub-commands are exposed as subatoms.
+      eq_partial({
+        { type = 'insert', keys = k('1i<NL><Esc>') },
+        { type = 'motion', keys = 'k', cmd = 'k', changed = false },
+        { type = 'motion', keys = '$' },
+      }, evs[1].atoms)
+      -- A scroll inside a mapping is not a subatom: the composite's keys must stay replayable, so
+      -- the scroll is elided.
+      fn.setline(1, { 'l1', 'l2', 'l3', 'l4', 'l5', 'l6' })
+      feed('3G')
+      command('nnoremap gk <C-e>j$')
+      feed('gk')
+      eq(4, fn.line('.'))
+      eq_partial({ type = 'mapping', lhs = 'gk', keys = 'j$' }, atom_last())
+      -- A recursive mapping (:nmap gJ gj) does not nest: the inner mapping's commands flatten
+      -- into ONE composite labeled with the typed LHS, with the same resolved keys.
+      command('nmap gJ gj')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa bbb' })
+      feed('gg04l')
+      local before = #atoms()
+      feed('gJ')
+      eq({ 'aaa ', 'bbb' }, get_lines())
+      evs = atoms()
+      eq(before + 1, #evs)
+      eq_partial({ type = 'mapping', lhs = 'gJ', keys = k('1i<NL><Esc>k$') }, evs[#evs])
+    end)
+
+    it('Visual-mode mapping spanning Visual/Normal/Insert is one atom', function()
+      -- Unlike Insert mode, Visual is a MODE_NORMAL mode, so atom_map_start() opens the composite
+      -- up front and it spans every mode the RHS passes through.
+      command('xnoremap q <esc>0lix<esc>l')
+      fn.setline(1, { 'ABCD' })
+      feed('gg0')
+      atoms_start()
+      feed('vl')
+      feed('q')
+      local evs = atoms()
+      eq(1, #evs)
+      eq_partial({ type = 'mapping', lhs = 'q', keys = k('vl<Esc>0l1ix<Esc>l') }, evs[1])
+      eq_partial({
+        { type = 'visual', keys = k('vl<Esc>') },
+        { type = 'motion', keys = '0' },
+        { type = 'motion', keys = 'l' },
+        { type = 'insert', keys = k('1ix<Esc>') },
+        { type = 'motion', keys = 'l' },
+      }, evs[1].atoms)
+      eq({ 'AxBCD' }, get_lines())
+    end)
+
+    it('mapping that returns to the mode it started in', function()
+      -- The composite closes where the returned-to mode resolves (insert-session end, selection use),
+      -- so the keys typed after the mapping fold into its atom.
+      command('inoremap <F2> <Esc>lli')
+      fn.setline(1, { 'abcdefg' })
+      feed('gg0')
+      atoms_start()
+      feed('iAB<F2>CD<Esc>')
+      local evs = atoms()
+      eq(2, #evs)
+      eq_partial({ type = 'insert', keys = k('1iAB<Esc>') }, evs[1])
+      -- `lhs` is the trigger plus the keys typed while the composite ran.
+      eq_partial({ type = 'mapping', lhs = k('<F2>CD<Esc>'), keys = k('ll1iCD<Esc>') }, evs[2])
+      eq({ 'ABaCDbcdefg' }, get_lines())
+
+      -- A Normal-mode mapping ending in Insert has the same shape: returning to the starting mode is
+      -- not special, the composite simply spans the session.
+      command('nnoremap <F3> lli')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'abcdefg' })
+      feed('gg0')
+      local before = #atoms()
+      feed('<F3>CD<Esc>')
+      evs = atoms()
+      eq(before + 1, #evs)
+      eq_partial({ type = 'mapping', lhs = k('<F3>CD<Esc>'), keys = k('ll1iCD<Esc>') }, evs[#evs])
+      eq({ 'abCDcdefg' }, get_lines())
+
+      -- Visual round-trip: selection is pending at mapping end, keeps the composite open.
+      command('xnoremap <F4> <Esc>jvl')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'abcd', 'efgh' })
+      feed('gg0')
+      before = #atoms()
+      feed('vl<F4>')
+      eq(before, #atoms())
+      feed('d')
+      evs = atoms()
+      eq(before + 1, #evs)
+      eq_partial({ type = 'mapping', lhs = k('<F4>d'), keys = k('vl<Esc>jvld') }, evs[#evs])
+      eq_partial({
+        { type = 'visual', keys = k('vl<Esc>') },
+        { type = 'motion', keys = 'j' },
+        { type = 'visual', keys = 'vld' },
+      }, evs[#evs].atoms)
+      eq({ 'abcd', 'eh' }, get_lines())
+    end)
+
+    it('Cmdline mapping captures Normal-mode tail', function()
+      -- Cmdline-mode is non-MODE_NORMAL, so atom_map_start() defers the composite.
+      command('cnoremap <F2> <C-c>x')
+      fn.setline(1, { 'ABCD' })
+      feed('gg0')
+      atoms_start()
+      feed(':')
+      feed('<F2>')
+      -- "x" resolves to its builtin translation "dl"; `lhs` is still the user input.
+      eq_partial({ type = 'operator', lhs = k('<F2>'), keys = 'dl' }, atom_last())
+      eq({ 'BCD' }, get_lines())
+
+      -- A mapping that stays in the cmdline opens no composite: the accepted cmdline is the atom,
+      -- labeled with the cmdline rather than the LHS.
+      command('cnoremap <F3> echo 1')
+      local before = #atoms()
+      feed(':<F3><CR>')
+      eq(before + 1, #atoms())
+      eq_partial({ type = 'excmd', lhs = ':echo 1\n', keys = ':echo 1\n' }, atom_last())
+    end)
+
+    it('Terminal-mode mapping captures Normal-mode tail', function()
+      -- Terminal-mode is non-MODE_NORMAL, so atom_map_start() defers the composite.
+      command('terminal')
+      command('tnoremap <F2> <C-\\><C-n>gg')
+      atoms_start()
+      feed('i') -- Enter Terminal-mode.
+      feed('<F2>')
+      eq({
+        { type = 'normal', lhs = 'i', keys = 'i' },
+        { type = 'jump', lhs = k('<F2>'), keys = 'gg' }, -- Labeled with the mapping.
+      }, atoms_tail(2, 'type', 'lhs', 'keys'))
+      eq('nt', api.nvim_get_mode().mode)
+
+      -- RHS returning to Terminal mode. The trailing "i" is not captured, unlike the typed "i".
+      command([[tnoremap <F3> <C-\><C-n>ggi]])
+      local before = #atoms()
+      feed('i')
+      feed('<F3>')
+      -- Only the typed "i" and the motion: the RHS's trailing "i" is captured as nothing.
+      eq(before + 2, #atoms())
+      eq({
+        { type = 'normal', lhs = 'i', keys = 'i' },
+        { type = 'jump', lhs = k('<F3>'), keys = 'gg' },
+      }, atoms_tail(2, 'type', 'lhs', 'keys'))
+      eq('t', api.nvim_get_mode().mode)
+    end)
+
+    it('":call" payload mapping appends payload to `keys`', function()
+      n.exec(t_atom.delsurround_vim)
+      fn.setline(1, { 'a (one)', 'b (two)' })
+      feed('gg0f(')
+      atoms_start()
+      feed('ds)') -- ")" is the getchar()'d payload
+      eq({ 'a one', 'b (two)' }, get_lines())
+      local ev = atom_last()
+      -- getchar() payload is appended to `keys`, replayable.
+      eq_partial({ lhs = 'ds)', keys = ':call DelSurround()\n)' }, ev)
+      feed('2G0f(')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+      eq({ 'a one', 'b two' }, get_lines())
+
+      -- input() payload is appended to `keys`, replayable.
+      n.exec([[
+        function! Suffix() abort
+          call setline('.', getline('.') .. input('suffix: '))
+        endfunction
+        nnoremap ,s :<C-U>call Suffix()<CR>
+      ]])
+      feed('gg')
+      feed(',sX<CR>')
+      n.poke_eventloop()
+      eq('a oneX', fn.getline(1))
+      ev = atom_last()
+      eq_partial({ lhs = k(',sX<CR>'), keys = ':call Suffix()\nX\r' }, ev)
+      feed('j')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+      eq('b twoX', fn.getline(2))
+
+      -- Operator-pending mapping (:omap custom motion, like vim-sneak "z") fully captured.
+      n.exec(t_atom.minisneak_vim)
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aa (x) here', 'bb (y) here' })
+      feed('gg0')
+      n.poke_eventloop()
+      feed('dzhe')
+      n.poke_eventloop()
+      eq('here', fn.getline(1))
+      ev = atom_last()
+      eq_partial(
+        { type = 'operator', operator = 'd', lhs = 'dzhe', keys = 'd:call MiniSneak()\nhe' },
+        ev
+      )
+      feed('j0')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+      eq('here', fn.getline(2))
+
+      -- An :omap that abandons the operator is still one replayable atom.
+      command('onoremap <F2> <Esc>x')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'abcd' })
+      feed('gg0')
+      local before = #atoms()
+      feed('d<F2>')
+      -- The typed "d" is part of the composite atom.
+      eq(before + 1, #atoms())
+      eq_partial({ type = 'mapping', lhs = k('d<F2>'), keys = k('<Esc>dl') }, atom_last())
+      eq({ 'bcd' }, get_lines())
+
+      -- Burst input ("f(" and the mapping arrive together): "f" peeks for a composing char with
+      -- mappings enabled, so "ds" resolves while "f(" is still executing. The motion is still its
+      -- own atom, and the K_IGNORE left by the peek stays out of `lhs`.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'a (one)' })
+      feed('gg0')
+      n.poke_eventloop()
+      feed('f(ds)')
+      eq({ 'a one' }, get_lines())
+      eq({
+        { type = 'motion', keys = 'f(', lhs = 'f(' },
+        { type = 'excmd', keys = ':call DelSurround()\n)', lhs = 'ds)' },
+      }, atoms_tail(2, 'type', 'keys', 'lhs'))
+
+      -- Same, mid-op ("t(" + "ds" in one batch): the next mapping is not the pending op's operand.
+      command('nnoremap ,D d')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'a x(one)' })
+      feed('gg0')
+      n.poke_eventloop()
+      feed(',Dt(ds)')
+      eq({ 'one' }, get_lines())
+      eq({
+        { type = 'operator', keys = 'dt(', lhs = ',Dt(' },
+        { type = 'excmd', keys = ':call DelSurround()\n)', lhs = 'ds)' },
+      }, atoms_tail(2, 'type', 'keys', 'lhs'))
+    end)
+
+    it('replay of deleted/redefined Lua mapping fails (E5117)', function()
+      n.exec_lua([[
+        vim.keymap.set('o', 'gt', function()
+          vim.cmd('normal! viw')
+        end)
+      ]])
+      fn.setline(1, { 'k1 k2', 'k3 k4' })
+      atoms_start()
+      feed('gg0dgt')
+      eq(' k2', fn.getline(1))
+      local ev = atom_last()
+      n.exec_lua([[
+        vim.keymap.del('o', 'gt')
+        vim.keymap.set('o', 'gt', function()
+          vim.cmd('normal! viw')
+        end)
+      ]])
+      feed('j0')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+      eq('k3 k4', fn.getline(2))
+      t.matches('E5117', fn.execute('messages'))
+      -- Running the (re-defined) mapping emits CmdAtom.keys with the updated id.
+      feed('dgt')
+      eq(' k4', fn.getline(2))
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(atom_last().keys))
+      eq('k4', fn.getline(2))
+    end)
+
+    it('temporary mapping ("submode"), expired by the next unrelated atom', function()
+      n.exec_lua([==[
+        local active = false
+        vim.api.nvim_create_autocmd('CmdAtom', {
+          callback = function(ev)
+            -- `cmd` is a key-notation name (unlike `keys`, which is raw bytes).
+            local resize = ev.data.cmd == '<C-W>+' or ev.data.cmd == '<C-W>-'
+            if resize then
+              -- Activate. Use of "+"/"-" resolves to the same cmd => re-activates.
+              vim.keymap.set('n', '+', '<C-w>+')
+              vim.keymap.set('n', '-', '<C-w>-')
+              active = true
+            elseif active then
+              vim.keymap.del('n', '+')
+              vim.keymap.del('n', '-')
+              active = false
+            end
+          end,
+        })
+        -- Also works if <c-w>+ was mapped to something else:
+        vim.cmd[[nnoremap <leader>+ <c-w>+]]
+      ]==])
+      --- Waits for the deferred CmdAtom to (de)activate the temporary mappings.
+      local function wait_active(active)
+        eq(
+          true,
+          n.exec_lua(
+            [[
+              local active = ...
+              return vim.wait(1000, function()
+                return (vim.fn.maparg('+', 'n') ~= '') == active
+              end)
+            ]],
+            active
+          )
+        )
+      end
+      fn.setline(1, { 'one', 'two' })
+      command('split')
+      local height = fn.winheight(0)
+      feed('<C-w>+')
+      wait_active(true) -- the deferred CmdAtom activated the mappings
+      eq(height + 1, fn.winheight(0))
+      feed('+') -- temporary mapping: resizes without the CTRL-W prefix
+      n.poke_eventloop()
+      eq(height + 2, fn.winheight(0))
+      feed('-') -- its own use emits the same resolved keys: stays active
+      n.poke_eventloop()
+      eq(height + 1, fn.winheight(0))
+      feed('j') -- any unrelated atom expires the mappings
+      wait_active(false)
+      feed('-') -- back to the builtin: a motion (up one line), not a resize
+      n.poke_eventloop()
+      eq(height + 1, fn.winheight(0))
+      eq(1, fn.line('.'))
+      -- A mapping whose atom RESOLVES to a resize also activates the submode.
+      feed('\\+')
+      n.poke_eventloop()
+      eq(height + 2, fn.winheight(0))
+      wait_active(true)
+    end)
+  end)
+
+  describe('insert-mode', function()
+    it('session captures its text', function()
+      fn.setline(1, { 'aaa' })
+      feed('gg0')
+      atoms_start()
+      -- No event for the "i" entry, and none per keystroke: one whole-session event at <Esc>.
+      feed('i')
+      eq(0, #atoms())
+      feed('X')
+      eq(0, #atoms())
+      feed('Y')
+      eq(0, #atoms())
+      feed('<Esc>')
+      local evs = atoms()
+      eq(1, #evs)
+      -- Insert keys always embed count ("1i…"). "dw" omits its count.
+      eq_partial({ type = 'insert', count = 1, text = 'XY', keys = k('1iXY<Esc>') }, evs[1])
+      -- Counted insert: entry cmd + text + <Esc> keys.
+      feed('3iZ<Esc>')
+      eq_partial({ type = 'insert', count = 3, text = 'Z' }, atom_last())
+    end)
+
+    it('mapping captures Normal-mode tail #41864', function()
+      -- Insert-mode is non-MODE_NORMAL, so atom_map_start() defers the composite.
+
+      -- "inoremap <Esc> <Esc>l": <Esc> ends the session; the trailing "l" runs in Normal mode.
+      command('inoremap <Esc> <Esc>l')
+      fn.setline(1, { 'echo hi' })
+      feed('W') -- column 5
+      atoms_start()
+      feed('i<Esc>')
+      -- Two atoms: (empty) insert session, then the mapping tail ("l").
+      local evs = atoms()
+      eq(2, #evs)
+      eq_partial({ type = 'insert', keys = k('1i<Esc>') }, evs[1])
+      eq_partial({ type = 'motion', lhs = k('<Esc>'), keys = 'l' }, evs[2])
+      -- The tail moved the cursor right (column 5), overriding the default leftward "<Esc>".
+      eq({ 1, 5 }, api.nvim_win_get_cursor(0))
+
+      -- Same shape when the session is not empty: the tail is independent of the session's text.
+      fn.setline(1, { 'echo hi' })
+      feed('gg0W') -- column 5 again
+      local before = #atoms() -- a second atoms_start() would double-register the collector
+      feed('iZZ<Esc>')
+      evs = atoms()
+      eq(before + 2, #evs)
+      eq_partial({ type = 'insert', keys = k('1iZZ<Esc>'), text = 'ZZ' }, evs[#evs - 1])
+      eq_partial({ type = 'motion', lhs = k('<Esc>'), keys = 'l' }, evs[#evs])
+      eq({ 'echo ZZhi' }, get_lines())
+      eq({ 1, 7 }, api.nvim_win_get_cursor(0))
+    end)
+
+    it('crazy mapping captured as type=insert + type=mapping', function()
+      -- The RHS leaves Insert mode, then runs motions and further insert sessions.
+      command('inoremap x ....<esc>0laa..<esc>ab<space><space><esc>hic<esc>')
+      fn.setline(1, { 'AB' })
+      feed('gg0')
+      atoms_start()
+      feed('ix')
+      local evs = atoms()
+      eq(2, #evs)
+      -- The insert-session (interrupted by the mapping) is a `type=insert` atom.
+      eq_partial({ type = 'insert', keys = k('1i....<Esc>'), text = ('.'):rep(4) }, evs[1])
+      -- The tail of the mapping (which started in insert-mode...) is a `type=mapping` atom.
+      eq_partial({
+        type = 'mapping',
+        lhs = 'x',
+        keys = k('0l1aa..<Esc>1ab  <Esc>h1ic<Esc>'),
+      }, evs[2])
+      -- Composite subatoms:
+      eq_partial({
+        { type = 'motion', keys = '0' },
+        { type = 'motion', keys = 'l' },
+        { type = 'insert', keys = k('1aa..<Esc>') },
+        { type = 'insert', keys = k('1ab  <Esc>') },
+        { type = 'motion', keys = 'h' },
+        { type = 'insert', keys = k('1ic<Esc>') },
+      }, evs[2].atoms)
+      eq({ ('..a..bc  %sAB'):format(('.'):rep(2)) }, get_lines())
+    end)
+
+    it('insert-session entered programmatically, still captures *user* input #41516', function()
+      atoms_start()
+      n.exec_lua([[
+        vim.keymap.set('i', '<C-j>', function()
+          vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<Esc>', true, false, true), 'n', false)
+          vim.schedule(function()
+            vim.api.nvim_feedkeys('i', 'n', false)
+          end)
+        end)
+      ]])
+      local before = #atoms()
+      feed('i')
+      n.exec_lua('vim.wait(50)')
+      feed('<C-j>')
+      n.exec_lua('vim.wait(50)')
+      feed('<Esc>')
+      local evs = atoms()
+      eq(before + 2, #evs)
+      eq({ k('1i<Esc>'), k('1i<Esc>') }, { evs[#evs - 1].keys, evs[#evs].keys })
+      -- Typed text within such a session lands in its atom...
+      n.exec_lua([[vim.schedule(function() vim.api.nvim_feedkeys('i', 'n', false) end)]])
+      n.exec_lua('vim.wait(50)')
+      feed('hi<Esc>')
+      eq_partial({ text = 'hi', keys = k('1ihi<Esc>') }, atom_last())
+      -- ...but with NO typed input within it, the session emits nothing.
+      before = #atoms()
+      n.exec_lua([[vim.schedule(function() vim.api.nvim_feedkeys('i', 'n', false) end)]])
+      n.exec_lua('vim.wait(50)')
+      n.exec_lua([[vim.api.nvim_feedkeys('\27', 'n', false)]])
+      eq(before, #atoms())
+    end)
+  end)
+
+  describe('visual', function()
+    it('replay; fallback to equal-size if unreplayable', function()
+      -- The core use-case for a plugin: observe CmdAtom, capture a Visual-mode
+      -- operation's resolved `keys`, and replay them verbatim to re-execute it.
+      fn.setline(1, { 'foo bar', 'longword bar' })
+      feed('gg0')
+      atoms_start()
+      feed('viwd') -- select the inner word and delete it
+      eq({ ' bar', 'longword bar' }, get_lines())
+      local ev = atom_last()
+      eq('visual', ev.type)
+
+      -- Replay the captured keys at line 2. The keysequence re-executes (not equal-size reselect):
+      -- "iw" selects cursor-relative word, so the delete adapts to the new context.
+      feed('j0')
+      n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+      eq({ ' bar', ' bar' }, get_lines())
+
+      -- A viewport scroll that drags the cursor along (edge/'scrolloff') grows the selection by
+      -- a viewport-dependent amount: void, no atom.
+      local lines = vim.tbl_map(function(i)
+        return 'l' .. i
+      end, fn.range(1, 30))
+      fn.setline(1, lines)
+      feed('gg')
+      local before = #atoms()
+      feed('V<C-e>')
+      eq(2, fn.line('.')) -- Scroll dragged the cursor: selection is lines 1-2.
+      feed('d')
+      -- Publishes with empty `CmdAtom.keys`; the keys that produced it are in `lhs`.
+      eq(before + 1, #atoms())
+      eq_partial({ type = 'visual', keys = '', lhs = k('V<C-E>d'), changed = true }, atom_last())
+      eq('l3', fn.getline(1)) -- The edit itself deleted both selected lines.
+
+      -- "." on the unreplayable operation falls back to equal-size reselect ("1v" + op).
+      feed('.')
+      eq('l5', fn.getline(1))
+
+      -- But a viewport key that preserves cursor ("zz") does not move the selection: still
+      -- replayable, and collected like any other subatom.
+      fn.setline(1, lines)
+      feed('gg')
+      before = #atoms()
+      feed('Vzzd')
+      eq('l2', fn.getline(1))
+      eq(before + 1, #atoms())
+      -- Nothing was translated, so lhs=keys.
+      eq_partial({ type = 'visual', keys = 'Vzzd', lhs = 'Vzzd' }, atom_last())
+      feed('.')
+      eq('l3', fn.getline(1))
+
+      --
+      -- Visual selection moved by a Lua mapping (via API): captured as the mapping cmd. #41956
+      --
+      n.exec_lua(function()
+        vim.keymap.set('x', 'gh', function()
+          local cursor = vim.api.nvim_win_get_cursor(0)
+          vim.api.nvim_win_set_cursor(0, { cursor[1], cursor[2] + 1 })
+          vim.cmd('normal! o')
+          vim.api.nvim_win_set_cursor(0, { cursor[1], cursor[2] + 3 })
+        end)
+      end)
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaaaaaa', 'bbb' })
+      feed('gg0vghd')
+      eq('aaaa', fn.getline(1))
+      eq('visual', atom_last().type)
+      feed('j0.')
+      eq('b', fn.getline(2)) -- The API move clamps on the short line; "1v" would have emptied it.
+      -- Also when only the fed key follows the API move: "o" alone would replay a 1-char selection.
+      -- Defined >=10 times: at least 1 mapping-id ends in "0" (exercises redobuf encoding...).
+      for _ = 1, 10 do
+        n.exec_lua(function()
+          vim.keymap.set('x', 'gH', function()
+            local cursor = vim.api.nvim_win_get_cursor(0)
+            vim.api.nvim_win_set_cursor(0, { cursor[1], cursor[2] + 1 })
+            vim.cmd('normal! o')
+          end)
+        end)
+        api.nvim_buf_set_lines(0, 0, -1, true, { 'aaaaaaa', 'bbbbbbb' })
+        feed('gg0vgHd')
+        eq('aaaaa', fn.getline(1))
+        feed('j0.')
+        eq('bbbbb', fn.getline(2))
+      end
+      -- A fed "gv" reselects marks the mapping set.
+      n.exec_lua(function()
+        vim.keymap.set('x', 'gs', function()
+          local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+          vim.fn.setpos("'<", { 0, row, col + 1, 0 })
+          vim.fn.setpos("'>", { 0, row, vim.fn.col('$') - 1, 0 })
+          vim.cmd.normal({ 'gv', bang = true })
+        end)
+      end)
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaaaaaa', 'bbbbbbbbbb' })
+      feed('gg0vgsd')
+      eq('', fn.getline(1))
+      feed('j0.')
+      eq('', fn.getline(2)) -- To end of line again; "1v" would have left 3 chars.
+
+      -- Textobject mapping that ends selection and reselects by "norm! <linenr>GV…". #41754
+      n.exec_lua(function()
+        vim.keymap.set('x', '<M-m>', function()
+          local cur_line = vim.fn.line('.')
+          vim.cmd('normal! \27')
+          vim.cmd(('normal! %dGV%dG'):format(cur_line, 2 * cur_line))
+        end)
+      end)
+      api.nvim_buf_set_lines(0, 0, -1, true, { '1', '2', '3', '4', '5', '6', '7', '8' })
+      feed('ggv<M-m>d')
+      eq({ '3', '4', '5', '6', '7', '8' }, get_lines())
+      feed('j.')
+      eq({ '3', '7', '8' }, get_lines())
+
+      -- "gv" is replayable, but "." redoes a fixed-size region ("1v"), like Vim.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa bbb ccc' })
+      feed('gg0viw<Esc>')
+      before = #atoms()
+      feed('gvd')
+      eq(' bbb ccc', fn.getline(1))
+      eq(before + 1, #atoms())
+      eq_partial({ type = 'visual', keys = 'gvd', lhs = 'gvd' }, atom_last())
+      feed('w.') -- "." containing "gv" replays "1v" fallback at the cursor ("bbb").
+      eq('  ccc', fn.getline(1))
+      -- Visual-entered Insert. The atom has "gv" (as typed), not redo's "1v" fallback.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa bbb ccc' })
+      feed('gg0viw<Esc>')
+      before = #atoms()
+      feed('gvcX<Esc>')
+      eq('X bbb ccc', fn.getline(1))
+      eq(before + 1, #atoms())
+      eq_partial({ type = 'visual', keys = k('gvcX<Esc>') }, atom_last())
+      feed('w.')
+      eq('X X ccc', fn.getline(1))
+
+      -- A fed (":normal!") Visual-put preps the selection keysequence, like any fed visual
+      -- operator (":normal! vjd"): "." re-executes "Vjp", not a bare "p".
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aa', 'bb', 'cc', 'dd', 'ee' })
+      feed('ggyy')
+      command('normal! Vjp')
+      eq({ 'aa', 'cc', 'dd', 'ee' }, get_lines())
+      feed('j.')
+      eq({ 'aa', 'aa', 'bb', 'ee' }, get_lines())
+
+      -- {Visual}r<C-V><CR> replaces with a literal <CR> (REPLACE_CR_NCHAR): inexpressible as
+      -- spec chars, so the literal keys compose the redo tail, which "." replays.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'abcd', 'efgh' })
+      feed('gg0vlr<C-V><CR>')
+      eq({ '\r\rcd', 'efgh' }, get_lines())
+      feed('j0.')
+      eq({ '\r\rcd', '\r\rgh' }, get_lines())
+
+      -- <Cmd> ":norm" mapping that extends the selection: "." replays it. #41323
+      command('xmap <M-m> <Cmd>normal! $<CR>')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa', 'bbb' })
+      feed('gg0v<M-m>d') -- "$" in Visual is one past EOL, so "d" swallows the newline (= plain v$d)
+      eq({ 'bbb' }, get_lines())
+      command('let v:errmsg = ""')
+      feed('.')
+      eq('', api.nvim_get_vvar('errmsg'))
+      eq('n', fn.mode()) -- Not in Visual.
+      eq({ '' }, get_lines())
+
+      -- <Cmd> ":norm" captured as itself (not its subatoms).
+      command('xmap <M-w> <Cmd>normal! e<CR>')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'one two three', 'four five six' })
+      feed('gg0v<M-w>d')
+      eq({ ' two three', 'four five six' }, get_lines())
+      eq_partial({ type = 'visual', keys = k('v<Cmd>normal! e<NL>d') }, atom_last())
+      feed('j0.')
+      eq({ ' two three', ' five six' }, get_lines())
+
+      -- Nested command can replace the pending selection, not just extend it. #41705
+      n.exec_lua(function()
+        vim.keymap.set('x', 'Z', function()
+          -- Mapping ends with the selection "open".
+          vim.cmd.normal({ vim.keycode('<Esc>viW'), bang = true })
+        end)
+      end)
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo.bar tail' })
+      feed('gg0')
+      command('normal viwZ')
+      feed('d')
+      eq({ ' tail' }, get_lines())
+      eq_partial({ type = 'visual', keys = 'viWd' }, atom_last())
+
+      -- Buffer-editing <Cmd> is captured as itself.
+      command('xmap <M-a> <Cmd>call append(1, "X")<CR>')
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'ab', 'cd' })
+      feed('gg0vl<M-a>d')
+      eq({ '', 'X', 'cd' }, get_lines())
+      eq_partial({ type = 'visual', keys = k('vl<Cmd>call append(1, "X")<NL>d') }, atom_last())
+      feed('3gg0.')
+      eq({ '', 'X', '' }, get_lines())
+
+      -- Search-extended selection: the payload travels in the collected keys.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'ab META x', 'cdef META y' })
+      feed('gg0v/META<CR>d')
+      eq({ 'ETA x', 'cdef META y' }, get_lines())
+      eq_partial({ type = 'visual', keys = k('v/META<NL>d') }, atom_last())
+      feed('j0.')
+      eq({ 'ETA x', 'ETA y' }, get_lines())
+
+      -- Excmd that visually-selects. Replaying ":" prefills "'<,'>"; keys place <C-U> internally.
+      exec([[
+        func SelectWord()
+          normal! viw
+        endfunc
+      ]])
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo bar', 'longword bar' })
+      feed('gg0v:<C-U>call SelectWord()<CR>d')
+      eq({ ' bar', 'longword bar' }, get_lines())
+      eq_partial({ type = 'visual', keys = k('v:<C-U>call SelectWord()<NL>d') }, atom_last())
+      feed('j0.')
+      eq({ ' bar', ' bar' }, get_lines())
+
+      -- Nothing typed a <C-U> here: this ":" keeps the prefilled range.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'a xx', 'b xx', 'c xx' })
+      feed('gg0Vj:s/xx/YY/<CR>')
+      eq({ 'a YY', 'b YY', 'c xx' }, get_lines())
+      eq(k("Vj:<C-U>'<,'>s/xx/YY/<NL>"), atom_last().keys)
+    end)
+
+    it('|visual-fixed-size| example in visual.txt', function()
+      n.exec_lua([[
+        local vop ---@type string?
+        vim.api.nvim_create_autocmd('CmdAtom', {
+          callback = function(ev)
+            if ev.data.type == 'visual' then
+              local children = ev.data.atoms
+              vop = children and children[#children].keys or nil
+            elseif ev.data.changed then
+              vop = nil  -- the last change is no longer the Visual one
+            end
+          end,
+        })
+        vim.keymap.set('n', '.', function()
+          vim.schedule(function()
+            vim.api.nvim_feedkeys(vop and ('1v' .. vop) or '.', 'n', false)
+          end)
+        end)
+      ]])
+      fn.setline(1, { 'foo bar', 'longword bar' })
+      feed('gg0viwd')
+      eq({ ' bar', 'longword bar' }, get_lines())
+      -- Equal-size repeat: a 3-char region at the cursor, NOT that line's word.
+      feed('j0.')
+      retry(nil, 1000, function()
+        eq({ ' bar', 'gword bar' }, get_lines())
+      end)
+      -- A non-visual change falls back to the builtin |.|.
+      feed('gg0x')
+      eq({ 'bar', 'gword bar' }, get_lines())
+      feed('j0.')
+      retry(nil, 1000, function()
+        eq({ 'bar', 'word bar' }, get_lines())
+      end)
+    end)
+  end)
+
+  describe('repeat.txt examples', function()
+    it('|action-repeat|', function()
+      n.exec_lua([[
+        _G.saved = nil
+        vim.api.nvim_create_autocmd('CmdAtom', { callback = function(ev) _G.last = ev.data end })
+        _G.save = function() _G.saved = _G.last end
+        _G.replay = function()
+          local d = _G.saved
+          vim.api.nvim_feedkeys(d.keys or d.lhs, d.keys and 'n' or 'm', false)
+        end
+      ]])
+      n.exec(t_atom.delsurround_vim)
+      command('nnoremap ,d x')
+      command('nnoremap <F6> xw')
+      command('let @q = "x"')
+      n.exec_lua([[
+        vim.keymap.set('n', ']e', function()
+          vim.api.nvim_set_current_line(vim.api.nvim_get_current_line() .. '!')
+        end)
+      ]])
+
+      --- Runs `keys` on line 1, then replays that atom on line 2 (both prefixed by `pre`). Reports
+      --- the atom's input/resolution pair, whether the resolution decomposes into subatoms, and
+      --- whether the replay reproduced line 1.
+      local function both(line, pre, keys)
+        api.nvim_buf_set_lines(0, 0, -1, true, { line, line })
+        feed('gg0' .. pre)
+        n.poke_eventloop()
+        feed(keys)
+        n.poke_eventloop()
+        n.exec_lua('_G.save()')
+        feed('2G0' .. pre)
+        n.poke_eventloop()
+        n.exec_lua('_G.replay()')
+        n.poke_eventloop()
+        local l = get_lines()
+        local d = n.exec_lua('return _G.saved')
+        local subs = d.atoms
+          and table.concat(vim.tbl_map(function(c)
+            return c.keys
+          end, d.atoms))
+        return { lhs = d.lhs, keys = d.keys, subs = subs, replayed = l[1] == l[2] }
+      end
+
+      -- Note the symmetry: "x", a mapping to "x", and a macro of "x" all resolve to "dl".
+      eq({
+        { lhs = 'dw', keys = 'dw', replayed = true },
+        { lhs = 'x', keys = 'dl', replayed = true },
+        { lhs = ',d', keys = 'dl', replayed = true },
+        { lhs = '@q', keys = 'dl', replayed = true },
+        { lhs = k('<F6>'), keys = 'dlw', subs = 'dlw', replayed = true },
+        -- No `keys` (Lua callback): the recipe feeds `lhs` with remapping.
+        { lhs = ']e', replayed = true },
+        -- getchar() ")" is appended to `keys`, replayable.
+        { lhs = 'ds)', keys = ':call DelSurround()\n)', replayed = true },
+      }, {
+        both('a one two', '', 'dw'),
+        both('aaa bbb', '', 'x'),
+        both('aaa bbb', '', ',d'),
+        both('aaa bbb', '', '@q'),
+        both('aaa bbb ccc', '', '<F6>'),
+        both('a b', '', ']e'),
+        both('a (one)', 'f(', 'ds)'),
+      })
+
+      -- Repeat fold command ("zf"). #9821
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'a {', '  x', '}', 'b {', '  y', '}' })
+      feed('gg0zfa{')
+      n.poke_eventloop()
+      n.exec_lua('_G.save()')
+      eq_partial(
+        { lhs = 'zfa{', keys = 'zfa{', changed = false, operator = 'zf' },
+        n.exec_lua('return _G.saved')
+      )
+      feed('zR4gg0') -- open the new fold, move past it
+      eq(0, fn.foldlevel(4))
+      n.exec_lua('_G.replay()')
+      n.poke_eventloop()
+      eq({ 4, 6 }, { fn.foldclosed(4), fn.foldclosedend(4) }) -- "zf" closes what it creates
+
+      -- Unreplayable: a void Visual op has empty keys, so the recipe feeds nothing
+      -- rather than replaying a viewport-dependent selection.
+      api.nvim_buf_set_lines(
+        0,
+        0,
+        -1,
+        true,
+        vim.tbl_map(function(i)
+          return 'l' .. i
+        end, fn.range(1, 30))
+      )
+      feed('gg')
+      feed(k('V<C-e>d'))
+      n.poke_eventloop()
+      n.exec_lua('_G.save()')
+      eq_partial({ keys = '' }, n.exec_lua('return _G.saved'))
+      local before = get_lines()
+      n.exec_lua('_G.replay()')
+      n.poke_eventloop()
+      eq(before, get_lines())
+
+      -- A repeat mapping is an atom too, and absent `keys` sends the recipe back to
+      -- its own `lhs`: a recorder must skip it, or the repeat replays itself.
+      n.exec_lua([[vim.keymap.set('n', '<F7>', function() end)]])
+      feed('<F7>')
+      n.poke_eventloop()
+      eq(
+        { type = 'mapping', lhs = k('<F7>') },
+        pick(n.exec_lua('return _G.last'), 'type', 'keys', 'lhs')
+      )
+    end)
+
+    it('|edit-repeat|', function()
+      n.exec_lua([[
+        local last ---@type vim.event.cmdatom.data?
+        vim.api.nvim_create_autocmd('CmdAtom', {
+          callback = function(ev)
+            local is_redo_or_undo = ev.data.changed
+              and (ev.data.undoseq or 0) <= (vim.b[ev.buf].maxseq or 0)
+            vim.b[ev.buf].maxseq = math.max(vim.b[ev.buf].maxseq or 0, ev.data.undoseq or 0)
+            if ev.data.changed and not is_redo_or_undo and ev.data.lhs ~= '.' then
+              last = ev.data
+            end
+          end,
+        })
+        vim.keymap.set('n', '.', function()
+          -- Multicursors: degrade to builtin ".", which repeats at each cursor.
+          local mc = vim.api.nvim_create_namespace('nvim.multicursor')
+          if #vim.api.nvim_buf_get_extmarks(0, mc, 0, -1, { limit = 1 }) > 0 then
+            vim.api.nvim_feedkeys('.', 'n', false)
+            return
+          end
+          vim.schedule(function()
+            if last then
+              vim.api.nvim_feedkeys(last.keys or last.lhs, last.keys and 'n' or 'm', false)
+            end
+          end)
+        end)
+      ]])
+      n.exec(t_atom.delsurround_vim)
+      fn.setline(1, { 'aa bb', 'a (one)', 'b (two)' })
+      -- "Builtin" edit.
+      feed('gg0dw')
+      n.poke_eventloop()
+      feed('.')
+      retry(nil, 1000, function()
+        eq('', fn.getline(1))
+      end)
+      -- Payload mapping: builtin "." could not repeat this (without e.g. vim-repeat).
+      feed('2G0f(ds)')
+      n.poke_eventloop()
+      eq('a one', fn.getline(2))
+      feed('3G0f(.')
+      retry(nil, 1000, function()
+        eq('b two', fn.getline(3))
+      end)
+
+      -- Edit fed by nvim_feedkeys(…, "mt") #41485.
+      n.exec_lua([[
+        vim.keymap.set('n', '<M-m>', function()
+          vim.api.nvim_feedkeys('dl', 'mt', false)
+        end)
+      ]])
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'abcd' })
+      feed('gg0<M-m>')
+      n.poke_eventloop()
+      eq('bcd', fn.getline(1))
+      feed('.')
+      retry(nil, 1000, function()
+        eq('cd', fn.getline(1))
+      end)
+
+      -- Undo is not captured: "." still repeats the edit.
+      feed('u')
+      n.poke_eventloop()
+      eq('bcd', fn.getline(1))
+      feed('.')
+      retry(nil, 1000, function()
+        eq('cd', fn.getline(1))
+      end)
+
+      -- Visual edit: replays the resolved keys, so "iw" selects the cursor-relative word.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo bar', 'longword bar' })
+      feed('gg0viwd')
+      n.poke_eventloop()
+      feed('j0.')
+      retry(nil, 1000, function()
+        eq({ ' bar', ' bar' }, get_lines())
+      end)
+      -- Visual change (insert session): selection, operator, text and <Esc> all replay.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'foo bar', 'longword bar' })
+      feed('gg0viwcX<Esc>')
+      n.poke_eventloop()
+      feed('j0.')
+      retry(nil, 1000, function()
+        eq({ 'X bar', 'X bar' }, get_lines())
+      end)
+
+      -- While multicursor is active, the "." mapping degrades to builtin "." so it cascades.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa', 'bbb', 'ccc' })
+      feed('gg0QjQj')
+      feed('x')
+      n.poke_eventloop()
+      eq({ 'aa', 'bb', 'cc' }, api.nvim_buf_get_lines(0, 0, -1, true))
+      feed('.')
+      retry(nil, 1000, function()
+        eq({ 'a', 'b', 'c' }, api.nvim_buf_get_lines(0, 0, -1, true))
+      end)
+    end)
+
+    it('|motion-repeat|', function()
+      n.exec_lua([[
+        local last ---@type string?
+        vim.api.nvim_create_autocmd('CmdAtom', {
+          pattern = 'motion',
+          callback = function(ev)
+            last = ev.data.keys
+          end,
+        })
+        vim.keymap.set('n', ',', function()
+          -- CmdAtom delivery is deferred: schedule the replay AFTER any pending
+          -- event, so `last` is fresh even when "," immediately follows a
+          -- motion. A scheduled replay is programmatic input: it emits no
+          -- CmdAtom itself (no feedback loop).
+          vim.schedule(function()
+            if last then
+              vim.api.nvim_feedkeys(last, 'n', false)  -- "n": already resolved
+            end
+          end)
+        end)
+      ]])
+      local screen = Screen.new(30, 3)
+      fn.setline(1, { 'aa bb cc dd ee' })
+      feed('gg0')
+      feed('2w') -- last motion: "2w" (count included)
+      n.poke_eventloop() -- deliver the deferred CmdAtom before ","
+      screen:expect([[
+        aa bb ^cc dd ee                |
+        {1:~                             }|
+                                      |
+      ]])
+      feed(',') -- repeated: "2w" again
+      screen:expect([[
+        aa bb cc dd ^ee                |
+        {1:~                             }|
+                                      |
+      ]])
+      feed('0fb') -- last motion: "fb" (payload char included)
+      n.poke_eventloop()
+      screen:expect([[
+        aa ^bb cc dd ee                |
+        {1:~                             }|
+                                      |
+      ]])
+      feed(',') -- repeated "fb": the second "b"
+      screen:expect([[
+        aa b^b cc dd ee                |
+        {1:~                             }|
+                                      |
+      ]])
+    end)
+
+    it('|restore-undo-cursor|: `pos`, `undoseq` restore across undo', function()
+      n.exec_lua([[
+        local seen = {} -- buf -> { prev = <seq>, [seq] = <cursor before that edit> }
+        vim.api.nvim_create_autocmd('CmdAtom', {
+          callback = function(ev)
+            local seq = ev.data.undoseq
+            if not seq then
+              return
+            end
+            local s = seen[ev.buf] or {}
+            seen[ev.buf] = s
+            if s.prev and seq < s.prev and s[seq + 1] then
+              vim.api.nvim_win_set_cursor(0, s[seq + 1]) -- undid: first state left behind
+            elseif s.prev and seq > s.prev and s[seq] then
+              vim.api.nvim_win_set_cursor(0, s[seq]) -- redid: a seq we already have
+            elseif ev.data.changed and not s[seq] then
+              s[seq] = ev.data.pos -- new edit
+            end
+            s.prev = seq
+          end,
+        })
+      ]])
+      command('nnoremap <F8> u')
+      --- Puts the cursor at `pre`, edits, then undoes via `undo`. Reports the
+      --- column before the edit and after the undo: they must match.
+      local function undone(pre, edit, undo)
+        api.nvim_buf_set_lines(0, 0, -1, true, { 'this is a test' })
+        n.poke_eventloop()
+        feed('gg0' .. pre)
+        n.poke_eventloop()
+        local before = fn.col('.')
+        feed(edit)
+        n.poke_eventloop()
+        -- Drained between steps: batched atoms would deliver the undo's restore
+        -- only after the redo already ran.
+        for _, step in ipairs(type(undo) == 'table' and undo or { undo }) do
+          if step:sub(1, 1) == ':' then
+            command(step:sub(2))
+          else
+            feed(step)
+          end
+          n.poke_eventloop()
+        end
+        return { before, fn.col('.') }
+      end
+      -- "a"/"o" enter Insert AFTER moving the cursor, so the session's `pos` must
+      -- come from the command frame, not from where the entry command landed.
+      -- The last five need `undoseq`: they are not recognizable from the keys.
+      eq(
+        { { 4, 4 }, { 4, 4 }, { 4, 4 }, { 7, 7 }, { 4, 4 }, { 4, 4 }, { 4, 4 }, { 4, 4 }, { 4, 4 } },
+        {
+          undone('lll', 'diw', 'u'),
+          undone('lll', 'aXY<Esc>', 'u'),
+          undone('lll', 'oXY<Esc>', 'u'),
+          undone('llllll', 'd^', 'u'),
+          undone('lll', 'diw', '<F8>'), -- mapping to undo
+          undone('lll', 'diwwdawdaw', '3u'), -- count
+          undone('lll', 'diwwdaw', ':undo 1'),
+          undone('lll', 'diw', 'g-'),
+          undone('lll', 'diw', { 'u', '0', '<C-r>' }), -- redo, after moving away
+        }
+      )
+    end)
+  end)
+
+  it('motions, search, excmd emit without an edit', function()
+    -- Emission is not tied to editing: every user action emits, so
+    -- plugins can observe all activity.
+    fn.setline(1, { 'alpha beta', 'gamma delta' })
+    feed('gg0')
+    atoms_start()
+    feed('w')
+    feed('3l')
+    feed('/gamma<CR>')
+    feed(':nohlsearch<CR>')
+    eq({
+      { type = 'motion', keys = 'w' },
+      { type = 'motion', keys = '3l' },
+      { type = 'motion', keys = k('/gamma<NL>') },
+      { type = 'excmd', keys = k(':nohlsearch<NL>') },
+    }, atoms_tail(4, 'type', 'keys'))
+
+    -- Cursor-relative marks ('< '. '{ …) are classified as type=motion. Other marks are type=jump.
+    feed('ma')
+    feed('`.')
+    feed("'[")
+    feed('`{')
+    feed('g`.')
+    feed('`a')
+    feed("g'a")
+    feed('G')
+    eq({
+      { type = 'motion', keys = '`.' },
+      { type = 'motion', keys = "'[" },
+      { type = 'motion', keys = '`{' },
+      { type = 'motion', keys = 'g`.' },
+      { type = 'jump', keys = '`a' },
+      { type = 'jump', keys = "g'a" },
+      { type = 'jump', keys = 'G' },
+    }, atoms_tail(7, 'type', 'keys'))
+
+    -- ":" embeds its count as the range prefill, never as composed digits;
+    -- the count field carries it.
+    feed('gg')
+    feed('2:<CR>')
+    eq(2, fn.line('.'))
+    eq_partial({ type = 'excmd', keys = k(':.,.+1<NL>'), count = 2, cmd = ':' }, atom_last())
+    eq({ 'alpha beta', 'gamma delta' }, get_lines()) -- nothing was edited
+    -- Scrolls and mouse presses also emit (type "scroll"/"mouse"): emit-only,
+    -- never cascaded.
+    feed('<C-e>')
+    feed('3<C-y>')
+    api.nvim_input_mouse('wheel', 'up', '', 0, 0, 0)
+    api.nvim_input_mouse('left', 'press', '', 0, 1, 2)
+    eq({
+      { type = 'scroll', keys = k('<C-E>') },
+      { type = 'scroll', keys = k('3<C-Y>') },
+      { type = 'scroll', keys = k('<ScrollWheelUp>') },
+      { type = 'mouse', keys = k('<LeftMouse>') },
+    }, atoms_tail(4, 'type', 'keys'))
+    eq(2, fn.line('.')) -- the click moved the cursor
+    -- <amatch>/match is the atom type, never path-expanded.
+    n.exec_lua([[
+      vim.api.nvim_create_autocmd('CmdAtom', {
+        callback = function(ev)
+          _G.last_match = ev.match
+        end,
+      })
+    ]])
+    feed('0w')
+    n.poke_eventloop()
+    eq('motion', n.exec_lua('return _G.last_match'))
+  end)
+
+  it('captures counts, payload', function()
+    fn.setline(1, { 'abcd,ef' })
+    feed('gg0')
+    atoms_start()
+    feed('yw')
+
+    -- A yank emits but does not edit.
+    eq_partial({ operator = 'y', changed = false }, atom_last())
+    feed('3x')
+    eq({ 'd,ef' }, get_lines())
+    feed('vf,d')
+    eq({ 'ef' }, get_lines())
+    eq({ '3dl', 'vf,d' }, atoms_tail(2))
+
+    -- Structured decomposition: operator/motion/operand as fields, no byte-parsing.
+    local op = atoms()[#atoms() - 1] -- "3dl"
+    eq(
+      { operator = 'd', cmd = 'l', count = 3, changed = true },
+      pick(op, 'operator', 'cmd', 'cmdarg', 'count', 'motionforce', 'changed')
+    )
+
+    -- A visual atom carries the completing operator's fields, and decomposes
+    -- into its commands ("v", "f," and the operator).
+    local vis = atom_last() -- "vf,d"
+    eq_partial({ type = 'visual', operator = 'd' }, vis)
+    eq({
+      { keys = 'v', cmd = 'v', changed = false },
+      { keys = 'f,', cmd = 'f', cmdarg = ',', changed = false },
+      { keys = 'd', changed = true }, -- the completing operator did the edit
+    }, subatoms(vis, 'keys', 'cmd', 'cmdarg', 'changed'))
+    eq('d', vis.atoms[3].operator)
+
+    -- Operators with an interactively-typed search payload: the atom is the
+    -- redobuff, which includes the payload.
+    fn.setline(1, { 'aa END bb' })
+    feed('gg0')
+    feed('d/END<CR>')
+    eq({ 'END bb' }, get_lines())
+    eq({ k('d/END<NL>') }, atoms_tail(1))
+    eq_partial({ operator = 'd', cmd = '/', changed = true }, atom_last())
+
+    -- An operand (mark or register name, target char) is its own field; the second char of a
+    -- two-char command NAME ("gJ") composes into `cmd`.
+    fn.setline(1, { 'one', 'two' })
+    feed('gg0magJ')
+    eq({ 'onetwo' }, get_lines()) -- "gJ": join without inserting a space
+    eq_partial({ cmd = 'm', cmdarg = 'a' }, atoms()[#atoms() - 1])
+    eq({ cmd = 'gJ' }, pick(atom_last(), 'cmd', 'cmdarg'))
+    local nrec = #atoms()
+    feed('qax') -- the recording register is an operand, not part of the name
+    feed('q')
+    eq_partial({ cmd = 'q', cmdarg = 'a' }, atoms()[nrec + 1])
+
+    -- Forced motion type ("dvj") is a field.
+    fn.setline(1, { 'one', 'two' })
+    feed('gg0dvj')
+    eq_partial({ operator = 'd', motionforce = 'v', cmd = 'j' }, atom_last())
+  end)
+
+  it('"!" operator captures its stuffed cmdline', function()
+    -- ":.,.+1!" + typed "{prg}<CR>" completes the operator atom, like "d/END<CR>". #41447
+    local prg = n.testprg('shell-test') .. ' REP 2 X'
+    fn.setline(1, { 'b', 'a', '', 'e', 'c', 'd' })
+    atoms_start()
+    feed('gg')
+    feed(('!ip%s<CR>'):format(prg))
+    eq({ '0: X', '1: X', '', 'e', 'c', 'd' }, get_lines())
+    local bang = atom_last()
+    local keys = ('!ip%s\n'):format(prg)
+    eq_partial({ type = 'operator', operator = '!', lhs = keys, keys = keys }, bang)
+    -- Replay recomputes the range from the motion: the whole 3-line paragraph is replaced.
+    feed('4G')
+    n.exec_lua(function(keys)
+      vim.api.nvim_feedkeys(keys, 'nx', false)
+    end, bang.keys)
+    eq({ '0: X', '1: X', '', '0: X', '1: X' }, get_lines())
+    -- Same for "=" with 'equalprg', "gq" with 'formatprg'.
+    api.nvim_set_option_value('equalprg', prg, {})
+    api.nvim_set_option_value('formatprg', prg, {})
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'b', 'a', '', 'd', 'c' })
+    feed('gg=ip')
+    eq({ '0: X', '1: X', '', 'd', 'c' }, get_lines())
+    eq_partial({ type = 'operator', operator = '=', keys = '=ip' }, atom_last())
+    feed('4Ggqip')
+    eq({ '0: X', '1: X', '', '0: X', '1: X' }, get_lines())
+    eq_partial({ type = 'operator', operator = 'gq', keys = 'gqip' }, atom_last())
+  end)
+
+  it('stuffed translations execute within their command (exec_stuffed)', function()
+    -- A register prefix crosses into the "." replay; an explicit register must not touch the
+    -- small-delete register.
+    atoms_start()
+    fn.setline(1, { 'aaa bbb', 'ccc ddd' })
+    feed('gg0dw')
+    eq('aaa ', fn.getreg('-'))
+    feed('j0"z.')
+    eq('ccc ', fn.getreg('z'))
+    eq('aaa ', fn.getreg('-'))
+    eq({ 'bbb', 'ddd' }, get_lines())
+    -- One atom: the stuffed replay collects into the "."-labeled composite.
+    eq_partial({ type = 'operator', lhs = k('"z.'), keys = '"zdw', reg = 'z' }, atom_last())
+    -- i_CTRL-O inside a stuffed translation's insert session ("S" == "cc"): the session resumes
+    -- after ONE normal command.
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'xxxx', 'yyyy' })
+    feed('ggSabc<C-o>0def<Esc>')
+    eq({ 'defabc', 'yyyy' }, get_lines())
+    -- i_CTRL-O resolution is lossy: keys=nil, replay the "S"-labeled `lhs` instead.
+    eq(
+      { type = 'mapping', lhs = k('Sabc<C-o>0def<Esc>') },
+      pick(atom_last(), 'type', 'lhs', 'keys')
+    )
+    -- r<Tab> under 'expandtab'/'smarttab' ("{count}R<Tab><Esc>": edit() does the tab).
+    command('set expandtab shiftwidth=4 tabstop=4')
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'abcdefgh', 'ABCDEFGH' })
+    feed('gg03r<Tab>')
+    eq('            defgh', fn.getline(1))
+    eq_partial({ type = 'insert', lhs = k('3r<Tab>'), keys = k('3R<Tab><Esc>') }, atom_last())
+    feed('j0.')
+    eq('            DEFGH', fn.getline(2))
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'abcdefgh' })
+    feed('gg0r<C-v><Tab>')
+    eq('\tbcdefgh', fn.getline(1))
+    command('set noexpandtab smarttab shiftwidth=4 tabstop=8')
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'abcdefgh' })
+    feed('gg02r<Tab>')
+    eq('\tcdefgh', fn.getline(1))
+    command('set expandtab& smarttab& shiftwidth& tabstop&')
+    -- "&" and "count&" (":.,.+Ns").
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'blue a', 'blue b', 'blue c', 'blue d' })
+    command('1s/blue/red/')
+    feed('2G&3G2&')
+    eq({ 'red a', 'red b', 'red c', 'red d' }, get_lines())
+    eq_partial({ type = 'excmd', lhs = '2&', keys = ':.,.+1s\n' }, atom_last())
+
+    -- Reg "." put re-inserts through edit(), and a mapping's composite labels it.
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'one' })
+    feed('ggifoo<Esc>')
+    feed('$".p')
+    eq('fooonefoo', fn.getline(1))
+    eq_partial({ type = 'insert', lhs = k('1afoo<Esc>'), keys = k('1afoo<Esc>') }, atom_last())
+    command('nnoremap ,p ".p')
+    feed(',p')
+    eq_partial({ type = 'insert', lhs = ',p', keys = k('1afoo<Esc>') }, atom_last())
+    -- Typed ":put ." emits typed cmdline payload, not the internal ":put _" translation.
+    feed(':put .<CR>')
+    eq('foo', fn.getline(2))
+    eq_partial({ type = 'excmd', lhs = ':put .\n', keys = ':put .\n', text = 'put .' }, atom_last())
+  end)
+
+  it('fires for user input, not programmatic sources', function()
+    atoms_start()
+    -- Drain deferred CmdAtom events, then return + clear the collected list.
+    local function take()
+      n.poke_eventloop()
+      return n.exec_lua([[local a = _G.atoms; _G.atoms = {}; return a]])
+    end
+    -- Fresh buffer + cursor via the API (no keys, so no motion atoms).
+    local function fresh()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'aaaaaaaa', 'bbbbbbbb' })
+      api.nvim_win_set_cursor(0, { 1, 0 })
+      take()
+    end
+
+    -- Typed input emits: real keys (nvim_input, via feed())...
+    fresh()
+    feed('x')
+    eq(1, #take())
+    -- ...and nvim_feedkeys() with the "t" (typed) flag.
+    n.exec_lua([[vim.api.nvim_feedkeys('x', 't', false)]])
+    eq(1, #take())
+
+    -- A typed macro folds into exactly ONE atom, labeled "@q".
+    fresh()
+    feed('qqxq') -- recording is typed input
+    take()
+    feed('@q')
+    local evs = take()
+    eq(1, #evs)
+    eq('@q', evs[1].lhs)
+
+    -- Programmatic / replayed input must NOT leak any atom.
+    fresh()
+    api.nvim_buf_set_lines(0, 0, 1, true, { 'ZZZZ' }) -- API buffer edit
+    eq(0, #take())
+    api.nvim_buf_set_text(0, 0, 0, 0, 1, { 'Q' })
+    eq(0, #take())
+    command('normal! x') -- :normal!
+    eq(0, #take())
+    command('normal x') -- :normal (with mappings)
+    eq(0, #take())
+    n.exec_lua([[vim.cmd('normal! x')]])
+    eq(0, #take())
+    n.exec_lua([[vim.api.nvim_feedkeys('x', '', false)]]) -- feedkeys without "t"
+    eq(0, #take())
+    command('nnoremap gj i<c-j><esc>k$')
+    n.exec_lua([[vim.api.nvim_feedkeys('gj', 'm', false)]]) -- remapped feedkeys without "t"
+    eq({}, take())
+    n.exec_lua([[vim.api.nvim_feedkeys('ihello\27', '', false)]]) -- insert session without "t"
+    eq({}, take())
+    command('normal! @q') -- macro played programmatically, not typed
+    eq(0, #take())
+    n.exec_lua([[vim.api.nvim_feedkeys('@q', '', false)]])
+    eq(0, #take())
+    command('normal! yy') -- prep-exempt operator (a yank builds no redo)
+    eq(0, #take())
+    n.exec_lua([[vim.api.nvim_feedkeys('viwd', '', false)]]) -- Visual sequence
+    eq(0, #take())
+
+    -- A timer/scheduled API edit must NOT leak.
+    n.exec_lua([[
+      _G.done = false
+      vim.defer_fn(function()
+        vim.api.nvim_buf_set_lines(0, 0, 1, true, { 'TTTT' })
+        _G.done = true
+      end, 5)
+    ]])
+    n.exec_lua('vim.wait(200, function() return _G.done end)')
+    eq(0, #take())
+
+    -- Sanity: typed input still emits after all the programmatic noise.
+    fresh()
+    feed('x')
+    eq(1, #take())
+  end)
+
+  it('one event per user action', function()
+    n.clear({ args = { '--clean' }, args_rm = { '--cmd' } })
+    --- Feeds `keys`, asserts exactly ONE new event, with the given keys.
+    local function atom(keys, expected, lhs, type_)
+      local before = #atoms()
+      feed(keys)
+      local evs = atoms()
+      eq(
+        { before + 1, k(expected), k(lhs or expected), type_ or evs[#evs].type },
+        { #evs, evs[#evs].keys, evs[#evs].lhs, evs[#evs].type }
+      )
+    end
+    fn.setline(1, fn['repeat']({ 'alpha beta gamma delta epsilon zeta' }, 20))
+    feed('gg0')
+    atoms_start()
+    -- "." with nothing to repeat stuffs nothing.
+    feed('.')
+    eq_partial({ type = 'normal', keys = '.', lhs = '.' }, atom_last())
+    -- Operators: the atom is the redobuff (count/register included).
+    -- "x" is normalized ("translated") to the elemental command "dl".
+    atom('x', 'dl', 'x')
+    -- A stuffed translation UNWRAPS: keeps the resolved "type" and has no subatoms.
+    -- Only `lhs` marks it as translated; it is not a composite.
+    eq({ type = 'operator' }, pick(atom_last(), 'type', 'atoms'))
+    atom('3x', '3dl', '3x')
+    atom('D', 'd$', 'D')
+    atom('dw', 'dw')
+    atom('"z2dw', '"z2dw')
+    atom('yy', 'yy')
+    atom('p', 'p')
+    atom('J', '2J')
+    atom('3J', '3J')
+    atom('r?', '1r?')
+    atom('~', '~')
+    atom('guiw', 'guiw')
+    atom('gUiw', 'gUiw')
+    atom('>>', '>>')
+    atom('dfa', 'dfa')
+    feed('ddk')
+    atom('P', 'P')
+    -- Insert sessions: one whole-session atom (entry + text + <Esc>).
+    atom('iXY<Esc>', '1iXY<Esc>')
+    atom('A!<Esc>', '1A!<Esc>')
+    atom('oNEW<Esc>', '1oNEW<Esc>')
+    atom('3iZ<Esc>', '3iZ<Esc>')
+    atom('cwWORD<Esc>', 'cwWORD<Esc>')
+    -- Visual: the full typed keysequence.
+    atom('viwd', 'viwd')
+    atom('Vd', 'Vd')
+    atom('<C-v>jd', '<C-V>jd')
+    -- Motions: the target is relative to the cursor.
+    atom('w', 'w')
+    atom('3w', '3w')
+    atom('fb', 'fb')
+    atom('$', '$')
+    feed('gg0')
+    atom(']]', ']]')
+    -- "%" is cursor-relative.
+    command('silent! nunmap %') -- the bundled matchit plugin maps it
+    fn.setline(1, 'alpha (beta) gamma')
+    feed('gg0f(')
+    atom('%', '%', nil, 'motion')
+    fn.setline(1, 'alpha beta gamma delta epsilon zeta')
+    -- "*" is cursor-relative, reads the word per-cursor.
+    feed('gg0')
+    atom('*', '*', nil, 'motion')
+    atom('g#', 'g#', nil, 'motion')
+    -- Jumps: absolute, the target is independent of the cursor.
+    feed('gg0')
+    atom('G', 'G', nil, 'jump')
+    atom('gg', 'gg', nil, 'jump')
+    atom('go', 'go', nil, 'jump')
+    atom('50%', '50%', nil, 'jump') -- "[count]%" is absolute, unlike "%".
+    atom('L', 'L', nil, 'jump')
+    atom('H', 'H', nil, 'jump')
+    atom('M', 'M', nil, 'jump')
+    atom('ma', 'ma', nil, 'normal') -- "m" sets state; it does not jump
+    atom('`a', '`a', nil, 'jump')
+    atom('<C-o>', '<C-O>', nil, 'jump')
+    -- Non-redoable commands: still emitted, as type "command".
+    atom('zz', 'zz', nil, 'normal')
+    atom('u', 'u')
+    atom('<C-r>', '<C-R>')
+    -- "." emits its resolution (like "x" => "dl").
+    feed('gg0')
+    atom('x', 'dl', 'x')
+    atom('.', 'dl', '.')
+    atom('3.', '3dl', '3.') -- "3.": the new count replaces the captured one
+    -- "." emits exactly ONE atom labeled ".": the repeated keys fold into its composite.
+    atom('iQ<Esc>', '1iQ<Esc>')
+    atom('.', '1iQ<Esc>', '.')
+    atom('viwd', 'viwd')
+    atom('.', 'viwd', '.')
+    atom('cwZZ<Esc>', 'cwZZ<Esc>')
+    atom('.', 'cwZZ<Esc>', '.')
+    -- Payload commands: the interactively-typed cmdline completes the
+    -- keysequence (not a bare "/" or ":" prefix).
+    atom('/beta<CR>', '/beta<NL>')
+    eq_partial({ type = 'motion', text = 'beta' }, atom_last())
+    atom('?alpha<CR>', '?alpha<NL>')
+    atom('2/beta<CR>', '2/beta<NL>')
+    -- Ex commands: their own atom kind, the cmdline is the "text" payload.
+    atom(':set tw=42<CR>', ':set<Space>tw=42<NL>')
+    eq_partial({ type = 'excmd', text = 'set tw=42' }, atom_last())
+    -- A nested cmdline opened by the command's own execution (":normal")
+    -- does not hijack the payload.
+    atom(':exe "normal! :echo 1\\r"<CR>', ':exe<Space>"normal!<Space>:echo<Space>1<Bslash>r"<NL>')
+    -- A mapping that ends mid-operation captures its continuation. ",D" emits nothing until the
+    -- typed "w" finishes the operation: one atom captures both.
+    command('nnoremap ,D d')
+    command('nnoremap ,V v')
+    before = #atoms()
+    feed(',D')
+    eq(before, #atoms())
+    atom('w', 'dw', ',Dw') -- The supplied motion finishes the operation
+    -- Same for a mapping that opens Visual mode: ESC closes the selection (cursor stays on the
+    -- selection end, where it moved during the Visual sequence).
+    feed(',V')
+    eq(before + 1, #atoms())
+    feed('<Esc>')
+    eq_partial({ type = 'visual', lhs = k(',V<Esc>'), keys = k('v<Esc>') }, atom_last())
+    -- A mapping whose trailing prefix is completed by TYPED keys ("," + "w")
+    -- ends where its own keys stop: each `lhs` owns only what it produced.
+    command('set notimeout')
+    command('nmap ,x j,')
+    command('nnoremap ,w w')
+    feed('gg0')
+    before = #atoms()
+    feed(',xw') -- no poke between: nvim awaits the pending "," under 'notimeout'
+    eq(before + 2, #atoms())
+    eq({
+      { type = 'motion', lhs = ',x', keys = 'j' },
+      { type = 'motion', lhs = ',w', keys = 'w' },
+    }, atoms_tail(2, 'type', 'lhs', 'keys'))
+    command('set notimeout&')
+    command('nunmap ,x')
+    command('nunmap ,w')
+    -- An ABORTED mapping emits nothing: an error discards its remaining
+    -- keys, and the composite with them.
+    command('nnoremap ,E :NoSuchCmd<CR>x')
+    local count = #atoms()
+    feed(',E') -- E492 mid-mapping: the trailing "x" never runs
+    eq(count, #atoms())
+    atom('x', 'dl', 'x') -- the next command is not folded into the dead composite
+    command('nmap ,A ,B')
+    command('nmap ,B ,A')
+    feed(',A') -- E223: recursive mapping
+    atom('x', 'dl', 'x')
+    -- Macro playback ("@q") emits its commands' atoms (capture-on-replay);
+    -- "@q" itself is a translation, never an atom.
+    local total = #atoms()
+    feed('qqxq')
+    feed('@q')
+    eq(total + 4, #atoms())
+    eq({ 'qq', 'dl', 'q', 'dl' }, atoms_tail(4))
+    -- The macro's atoms fold into one "@x"-labeled composite, like a mapping.
+    eq('@q', atom_last().lhs)
+    -- A typed scroll emits its own (emit-only) atom kind.
+    feed('<C-d>')
+    eq(total + 5, #atoms())
+    eq_partial({ type = 'scroll', keys = k('<C-D>') }, atom_last())
+    -- An 'indentexpr' that runs ":normal" opens a nested command-frame mid-operator: "gq" still
+    -- pushes its own atom, after the edit.
+    exec([[
+      func Indent()
+        exe "normal! \<Ignore>"
+        return 0
+      endfunc
+      setlocal indentexpr=Indent() textwidth=20
+    ]])
+    atom('Vgq', 'Vgq')
+    eq(true, atom_last().changed)
+  end)
+
+  it('captures prep-exempt operators (zfap) and fold/view commands', function()
+    fn.setline(1, { 'aa', 'aa', '' })
+    feed('gg0')
+    atoms_start()
+    feed('zfap')
+    eq({ 'zfap' }, atoms_tail(1))
+    eq('operator', atom_last().type)
+    eq(1, fn.foldclosed(1))
+    feed('za')
+    eq({ 'za' }, atoms_tail(1))
+    -- Neither an operator nor a motion: its own kind.
+    eq('normal', atom_last().type)
+    eq(-1, fn.foldclosed(1))
+  end)
+
+  it('captures "do"/"dp" (:diffget/:diffput); "." repeats them (unlike Vim)', function()
+    atoms_start()
+    command('new')
+    fn.setline(1, { 'a', 'b', 'c', 'd' })
+    command('diffthis | vnew')
+    fn.setline(1, { 'a', 'XY', 'c', 'ZW' })
+    command('diffthis')
+    feed('2G')
+    local before = #atoms()
+    feed('do')
+    eq(before + 1, #atoms())
+    eq_partial({ type = 'operator', keys = 'do' }, atom_last())
+    eq('b', fn.getline(2))
+    feed('2j.') -- Repeats "do" at the next hunk.
+    eq('d', fn.getline(4))
+    feed('2Gx')
+    feed('dp')
+    eq_partial({ type = 'operator', keys = 'dp' }, atom_last())
+    eq({ '' }, fn.getbufline(fn.bufnr('#'), 2))
+  end)
+
+  it("operatorfunc atom includes the getchar()'d payload", function()
+    n.exec(t_atom.minisurround_vim)
+    fn.setline(1, { 'alpha beta' })
+    feed('gg0')
+    atoms_start()
+    feed('ysiw"')
+    -- One atom: the mapping captures the operation finished by "iw". `keys` is the redobuff plus
+    -- the getchar() payload: a replayed opfunc reads the same wrap char.
+    eq_partial({ type = 'operator', keys = 'g@iw"', lhs = 'ysiw"' }, atom_last())
+    eq({ '"alpha" beta' }, get_lines())
+  end)
+
+  it('operator completed by a Lua textobject (:omap) #41482', function()
+    -- Lua :omap textobject (starts Visual mode, |omap-info|) captures the operator: `keys` is the
+    -- redobuff (K_LUA + mapping-id).
+    n.exec_lua([[
+      vim.keymap.set('o', 'gt', function()
+        vim.cmd('normal! viw')
+      end)
+    ]])
+    fn.setline(1, { 'aaa xxx', 'bbb yyy', 'ccc zzz' })
+    atoms_start()
+    feed('gg0wdgt')
+    eq('aaa ', fn.getline(1))
+    local ev = atom_last()
+    eq(
+      { type = 'operator', operator = 'd', lhs = 'dgt', changed = true },
+      pick(ev, 'type', 'operator', 'lhs', 'cmd', 'changed')
+    )
+    t.matches('^d\128', ev.keys) -- "d" + K_LUA…: the redobuf.
+    feed('j0w')
+    n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+    eq('bbb ', fn.getline(2))
+    -- "." repeats it, captured as one "."-labeled operator atom.
+    feed('j0w.')
+    eq('ccc ', fn.getline(3))
+    eq_partial({ type = 'operator', operator = 'd', lhs = '.' }, atom_last())
+
+    -- 'operatorfunc' + Lua textobject: "ghgt". Non-edit, still emits its operator atom.
+    n.exec_lua([[
+      _G.oplog = {}
+      vim.keymap.set('n', 'gh', function()
+        vim.o.operatorfunc = function(mtype)
+          table.insert(_G.oplog, mtype)
+        end
+        return 'g@'
+      end, { expr = true })
+    ]])
+    feed('gg0ghgt')
+    eq({ 'char' }, n.exec_lua('return _G.oplog'))
+    ev = atom_last()
+    eq(
+      { type = 'operator', operator = 'g@', lhs = 'ghgt', changed = false },
+      pick(ev, 'type', 'operator', 'lhs', 'cmd', 'changed')
+    )
+    t.matches('^g@\128', ev.keys) -- "g@" + K_LUA….
+    n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+    eq({ 'char', 'char' }, n.exec_lua('return _G.oplog'))
+
+    -- Lua 'operatorfunc' editing via ":norm!" must not clobber the captured "g@" redo/atom.
+    n.exec_lua([[
+      vim.keymap.set('n', 'gr', function()
+        vim.o.operatorfunc = function()
+          vim.cmd([=[normal! `[v`]rX]=])
+        end
+        return 'g@'
+      end, { expr = true })
+    ]])
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'mmm nnn', 'ooo ppp' })
+    feed('gg0grgt')
+    eq('XXX nnn', fn.getline(1))
+    ev = atom_last()
+    eq_partial({ type = 'operator', operator = 'g@', lhs = 'grgt', changed = true }, ev)
+    t.matches('^g@\128', ev.keys) -- "g@" + K_LUA….
+    feed('j0')
+    n.exec_lua(([[vim.api.nvim_feedkeys(%q, 'nx', false)]]):format(ev.keys))
+    eq('XXX ppp', fn.getline(2))
+
+    -- Aborted operator (cpo+=E empty region) cancels its redo: no atom captured.
+    command('set cpo+=E')
+    n.exec_lua([[vim.keymap.set('o', 'ge', function() end)]])
+    feed('dge')
+    eq('XXX ppp', fn.getline(2))
+    eq_partial({ type = 'mapping', lhs = 'dge', changed = false }, atom_last())
+    command('set cpo-=E')
+  end)
+
+  it('does not capture inputsecret() input', function()
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa' })
+    n.exec_lua(function()
+      vim.keymap.set('n', 'sp', function()
+        _G.pw = vim.fn.inputsecret('Password: ')
+        vim.api.nvim_put({ 'X' }, 'c', false, true)
+      end)
+    end)
+    feed('gg0')
+    atoms_start()
+    feed('sp')
+    feed('hunter2<CR>')
+    feed('<Esc>') -- The composite resolves at the next clock edge.
+    eq('hunter2', n.exec_lua('return _G.pw')) -- The function gets the input.
+    eq({ type = 'mapping', lhs = 'sp' }, pick(atoms()[1], 'type', 'lhs', 'keys')) -- Not CmdAtom.
+  end)
+
+  it('reports the original buffer', function()
+    n.exec_lua([[
+      _G.evs = {}
+      vim.api.nvim_create_autocmd('CmdAtom', {
+        callback = function(ev)
+          table.insert(_G.evs, { buf = ev.buf, keys = ev.data.keys, changed = ev.data.changed })
+        end,
+      })
+    ]])
+    command('let g:abufs = []')
+    command("autocmd CmdAtom * call add(g:abufs, expand('<abuf>')->str2nr())")
+    local a = api.nvim_get_current_buf()
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa bbb' })
+    command('badd other')
+    local b = api.nvim_list_bufs()[2]
+    command('nnoremap ]b <Cmd>bprev<CR>')
+
+    -- An edit reports its own buffer, and `changed`.
+    feed('gg0dw')
+    -- Leaving the buffer reports the buffer the command ran IN, not the one it
+    -- landed in. `changed` is about that same buffer: ":bnext" edits nothing.
+    feed(':bnext<CR>')
+    eq(b, api.nvim_get_current_buf())
+    -- Same, from a mapping, in the other direction.
+    feed(']b')
+    eq(a, api.nvim_get_current_buf())
+    local evs = n.exec_lua('return _G.evs')
+    eq({
+      { buf = a, keys = 'dw', changed = true },
+      { buf = a, keys = ':bnext\n', changed = false },
+      { buf = b, keys = ('%sbprev\n'):format(k('<Cmd>')), changed = false },
+    }, { evs[#evs - 2], evs[#evs - 1], evs[#evs] })
+    -- <abuf> agrees with the Lua callback's `buf`.
+    local abufs = n.eval('g:abufs')
+    eq({ a, a, b }, { abufs[#abufs - 2], abufs[#abufs - 1], abufs[#abufs] })
+  end)
+
+  it('reports `moved`/`pos` for the original buffer+window', function()
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'aaa bbb', 'ccc ddd', 'eee fff' })
+    n.exec_lua([[
+      _G.jump = function() vim.api.nvim_win_set_cursor(0, { 3, 0 }) end
+      vim.keymap.set('n', ']c', '<Cmd>lua _G.jump()<CR>')
+    ]])
+    atoms_start()
+
+    -- A plugin motion via "<Cmd>" is type="excmd" (its RHS implementation); `moved`
+    -- reports the same observed effect as the builtin motion below it.
+    feed('gg0]c')
+    eq(3, fn.line('.'))
+    eq_partial({ type = 'excmd', moved = true, changed = false, pos = { 1, 0 } }, atom_last())
+    feed('gg0w')
+    eq_partial({ type = 'motion', moved = true, changed = false }, atom_last())
+    -- A motion that did not move is still a motion; `moved` is the separate question.
+    eq(
+      { { 'motion', false }, { 'motion', false }, { 'motion', false }, { 'normal', false } },
+      vim.tbl_map(function(keys)
+        feed(keys)
+        local a = atom_last()
+        return { a.type, a.moved }
+      end, { 'G$w', 'gg0fz', 'gg0h', 'gg0zz' })
+    )
+
+    -- Register-only operator also moves without changing: a motion carries no `operator`.
+    feed('gg0wyb')
+    eq_partial({ moved = true, changed = false, operator = 'y' }, atom_last())
+
+    -- Switching window is not a cursor-move, even on the SAME buffer: `pos` is per-window.
+    command('split')
+    feed('gg')
+    command('wincmd j')
+    feed('3G')
+    command('wincmd k')
+    feed('<C-w>w')
+    eq(3, fn.line('.'))
+    eq_partial({ type = 'normal', moved = false }, atom_last())
+
+    -- Both are measured on the buffer/window the action STARTED in, so acting
+    -- and then navigating away still reports the effect.
+    command('nnoremap ]x <Cmd>normal! dd<CR><Cmd>wincmd w<CR>')
+    command('nnoremap ]y <Cmd>normal! j<CR><Cmd>wincmd w<CR>')
+    feed('gg]x')
+    eq_partial({ changed = true, moved = false }, atom_last())
+    command('wincmd w')
+    feed('gg]y')
+    eq_partial({ changed = false, moved = true }, atom_last())
+
+    -- Switching buffer is not a cursor-move.
+    command('only')
+    local main = api.nvim_get_current_buf()
+    command('edit other')
+    api.nvim_buf_set_lines(0, 0, -1, true, { 'x', 'y', 'z' })
+    feed('3G')
+    feed('<C-^>') -- back to `main`, whose cursor is on another line
+    eq(main, api.nvim_get_current_buf())
+    eq_partial({ type = 'normal', moved = false, pos = { 3, 0 } }, atom_last())
+  end)
+end)

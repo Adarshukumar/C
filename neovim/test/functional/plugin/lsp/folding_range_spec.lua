@@ -1,0 +1,835 @@
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
+local Screen = require('test.functional.ui.screen')
+local t_lsp = require('test.functional.plugin.lsp.testutil')
+
+local describe, it, before_each, after_each = t.describe, t.it, t.before_each, t.after_each
+local dedent = t.dedent
+local eq = t.eq
+local retry = t.retry
+
+local clear_notrace = t_lsp.clear_notrace
+local create_server_definition = t_lsp.create_server_definition
+
+local api = n.api
+local exec_lua = n.exec_lua
+local insert = n.insert
+local command = n.command
+local feed = n.feed
+
+describe('vim.lsp.folding_range', function()
+  local text = [[// foldLevel() {{{2
+/// @return  fold level at line number "lnum" in the current window.
+static int foldLevel(linenr_T lnum)
+{
+  // While updating the folds lines between invalid_top and invalid_bot have
+  // an undefined fold level.  Otherwise update the folds first.
+  if (invalid_top == 0) {
+    checkupdate(curwin);
+  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {
+    return prev_lnum_lvl;
+  } else if (lnum >= invalid_top && lnum <= invalid_bot) {
+    return -1;
+  }
+
+  // Return quickly when there is no folding at all in this window.
+  if (!hasAnyFolding(curwin)) {
+    return 0;
+  }
+
+  return foldLevelWin(curwin, lnum);
+}]]
+
+  local result = {
+    {
+      endLine = 19,
+      kind = 'region',
+      startCharacter = 1,
+      startLine = 3,
+    },
+    {
+      endCharacter = 2,
+      endLine = 7,
+      kind = 'region',
+      startCharacter = 25,
+      startLine = 6,
+    },
+    {
+      endCharacter = 2,
+      endLine = 9,
+      kind = 'region',
+      startCharacter = 55,
+      startLine = 8,
+    },
+    {
+      endCharacter = 2,
+      endLine = 11,
+      kind = 'region',
+      startCharacter = 58,
+      startLine = 10,
+    },
+    {
+      endCharacter = 2,
+      endLine = 16,
+      kind = 'region',
+      startCharacter = 31,
+      startLine = 15,
+    },
+    {
+      endCharacter = 68,
+      endLine = 1,
+      kind = 'comment',
+      startCharacter = 2,
+      startLine = 0,
+    },
+    {
+      endCharacter = 64,
+      endLine = 5,
+      kind = 'comment',
+      startCharacter = 4,
+      startLine = 4,
+    },
+  }
+
+  local bufnr ---@type integer
+  local client_id ---@type integer
+
+  clear_notrace()
+  before_each(function()
+    clear_notrace()
+
+    exec_lua(create_server_definition)
+    bufnr = n.api.nvim_get_current_buf()
+    client_id = exec_lua(function()
+      _G.folding_ranges = result
+      _G.server = _G._create_server({
+        capabilities = {
+          foldingRangeProvider = true,
+        },
+        handlers = {
+          ['textDocument/foldingRange'] = function(_, _, callback)
+            callback(nil, _G.folding_ranges)
+          end,
+        },
+      })
+
+      vim.api.nvim_win_set_buf(0, bufnr)
+
+      return vim.lsp.start({ name = 'dummy', cmd = _G.server.cmd })
+    end)
+    command('set foldmethod=expr foldcolumn=1 foldlevel=999')
+    insert(text)
+  end)
+  after_each(function()
+    api.nvim_exec_autocmds('VimLeavePre', { modeline = false })
+  end)
+
+  describe('expr()', function()
+    --- @type test.functional.ui.screen
+    local screen
+    before_each(function()
+      screen = Screen.new(80, 45)
+      command([[set foldexpr=v:lua.vim.lsp.foldexpr()]])
+      command([[split]])
+    end)
+
+    it('controls whether folding range is enabled', function()
+      eq(
+        true,
+        exec_lua(function()
+          return vim.lsp._capability.is_enabled('folding_range', { bufnr = 0 })
+        end)
+      )
+      command [[setlocal foldexpr=]]
+      eq(
+        false,
+        exec_lua(function()
+          return vim.lsp._capability.is_enabled('folding_range', { bufnr = 0 })
+        end)
+      )
+      command([[set foldexpr=v:lua.vim.lsp.foldexpr()]])
+      eq(
+        true,
+        exec_lua(function()
+          return vim.lsp._capability.is_enabled('folding_range', { bufnr = 0 })
+        end)
+      )
+    end)
+
+    it('can compute fold levels', function()
+      ---@type table<integer, string>
+      local foldlevels = {}
+      for i = 1, 21 do
+        foldlevels[i] = exec_lua('return vim.lsp.foldexpr(' .. i .. ')')
+      end
+      eq({
+        [1] = '>1',
+        [2] = '<1',
+        [3] = '0',
+        [4] = '>1',
+        [5] = '>2',
+        [6] = '<2',
+        [7] = '>2',
+        [8] = '<2',
+        [9] = '>2',
+        [10] = '<2',
+        [11] = '>2',
+        [12] = '<2',
+        [13] = '1',
+        [14] = '1',
+        [15] = '1',
+        [16] = '>2',
+        [17] = '<2',
+        [18] = '1',
+        [19] = '1',
+        [20] = '<1',
+        [21] = '0',
+      }, foldlevels)
+    end)
+
+    it('treats unknown folding range kinds like an absent kind #41765', function()
+      exec_lua(function()
+        _G.folding_ranges = {
+          { startLine = 0, endLine = 1, kind = 'function' },
+          { startLine = 3, endLine = 4 },
+          { startLine = 6, endLine = 7, kind = '' },
+          { startLine = 9, endLine = 10, kind = 'comment' },
+          { startLine = 12, endLine = 13, kind = 'imports' },
+          { startLine = 15, endLine = 16, kind = 'region' },
+        }
+        vim.lsp._folding_range.on_refresh(
+          nil,
+          nil,
+          { method = 'workspace/foldingRange/refresh', client_id = client_id }
+        )
+      end)
+
+      retry(nil, nil, function()
+        eq(
+          {
+            '>1',
+            '<1',
+            '0',
+            '>1',
+            '<1',
+            '0',
+            '>1',
+            '<1',
+            '0',
+            '>1',
+            '<1',
+            '0',
+            '>1',
+            '<1',
+            '0',
+            '>1',
+            '<1',
+          },
+          exec_lua(function()
+            local levels = {}
+            for lnum = 1, 17 do
+              levels[lnum] = vim.lsp.foldexpr(lnum)
+            end
+            return levels
+          end)
+        )
+      end)
+
+      exec_lua(function()
+        for _, kind in ipairs({ 'comment', 'imports', 'region', 'function', '' }) do
+          vim.lsp.foldclose(kind)
+        end
+      end)
+      -- Unknown and absent kinds are not selected by kind-specific folding.
+      eq(
+        { -1, -1, -1, 10, 13, 16 },
+        exec_lua(function()
+          return vim.tbl_map(vim.fn.foldclosed, { 1, 4, 7, 10, 13, 16 })
+        end)
+      )
+
+      command('normal! zM')
+      eq(
+        { 1, 4, 7, 10, 13, 16 },
+        exec_lua(function()
+          return vim.tbl_map(vim.fn.foldclosed, { 1, 4, 7, 10, 13, 16 })
+        end)
+      )
+    end)
+
+    it('refreshes folding ranges on request', function()
+      local function foldlevels()
+        return exec_lua(function()
+          return { vim.lsp.foldexpr(1), vim.lsp.foldexpr(2), vim.lsp.foldexpr(3) }
+        end)
+      end
+
+      retry(nil, nil, function()
+        eq({ '>1', '<1', '0' }, foldlevels())
+      end)
+
+      exec_lua(function()
+        _G.folding_ranges = { { startLine = 1, endLine = 2 } }
+        vim.lsp._folding_range.on_refresh(
+          nil,
+          nil,
+          { method = 'workspace/foldingRange/refresh', client_id = client_id }
+        )
+      end)
+
+      retry(nil, nil, function()
+        eq({ '0', '>1', '<1' }, foldlevels())
+      end)
+    end)
+
+    it('updates folds in all windows', function()
+      screen:expect({
+        grid = [[
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {3:[No Name] [+]                                                                   }|
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }}                                                                              |
+  {2:[No Name] [+]                                                                   }|
+                                                                                  |
+  ]],
+      })
+    end)
+
+    it('persists wherever foldexpr is set', function()
+      command([[setlocal foldexpr=]])
+      feed('<C-w><C-w>zx')
+      screen:expect({
+        grid = [[
+  {7: }// foldLevel() {{{2                                                            |
+  {7: }/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7: }{                                                                              |
+  {7: }  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7: }  // an undefined fold level.  Otherwise update the folds first.               |
+  {7: }  if (invalid_top == 0) {                                                      |
+  {7: }    checkupdate(curwin);                                                       |
+  {7: }  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7: }    return prev_lnum_lvl;                                                      |
+  {7: }  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7: }    return -1;                                                                 |
+  {7: }  }                                                                            |
+  {7: }                                                                               |
+  {7: }  // Return quickly when there is no folding at all in this window.            |
+  {7: }  if (!hasAnyFolding(curwin)) {                                                |
+  {7: }    return 0;                                                                  |
+  {7: }  }                                                                            |
+  {7: }                                                                               |
+  {7: }  return foldLevelWin(curwin, lnum);                                           |
+  {7: }}                                                                              |
+  {2:[No Name] [+]                                                                   }|
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {3:[No Name] [+]                                                                   }|
+                                                                                  |
+  ]],
+      })
+    end)
+
+    it('synchronizes changed rows with their previous foldlevels', function()
+      command('1,2d')
+      screen:expect({
+        grid = [[
+  {7: }^static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }}                                                                              |
+  {1:~                                                                               }|*2
+  {3:[No Name] [+]                                                                   }|
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }}                                                                              |
+  {1:~                                                                               }|*2
+  {2:[No Name] [+]                                                                   }|
+                                                                                  |
+]],
+      })
+    end)
+
+    it('clears folds when sole client detaches', function()
+      exec_lua(function()
+        vim.lsp.buf_detach_client(bufnr, client_id)
+      end)
+      screen:expect({
+        grid = [[
+  {7: }// foldLevel() {{{2                                                            |
+  {7: }/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7: }{                                                                              |
+  {7: }  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7: }  // an undefined fold level.  Otherwise update the folds first.               |
+  {7: }  if (invalid_top == 0) {                                                      |
+  {7: }    checkupdate(curwin);                                                       |
+  {7: }  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7: }    return prev_lnum_lvl;                                                      |
+  {7: }  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7: }    return -1;                                                                 |
+  {7: }  }                                                                            |
+  {7: }                                                                               |
+  {7: }  // Return quickly when there is no folding at all in this window.            |
+  {7: }  if (!hasAnyFolding(curwin)) {                                                |
+  {7: }    return 0;                                                                  |
+  {7: }  }                                                                            |
+  {7: }                                                                               |
+  {7: }  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {3:[No Name] [+]                                                                   }|
+  {7: }// foldLevel() {{{2                                                            |
+  {7: }/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7: }{                                                                              |
+  {7: }  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7: }  // an undefined fold level.  Otherwise update the folds first.               |
+  {7: }  if (invalid_top == 0) {                                                      |
+  {7: }    checkupdate(curwin);                                                       |
+  {7: }  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7: }    return prev_lnum_lvl;                                                      |
+  {7: }  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7: }    return -1;                                                                 |
+  {7: }  }                                                                            |
+  {7: }                                                                               |
+  {7: }  // Return quickly when there is no folding at all in this window.            |
+  {7: }  if (!hasAnyFolding(curwin)) {                                                |
+  {7: }    return 0;                                                                  |
+  {7: }  }                                                                            |
+  {7: }                                                                               |
+  {7: }  return foldLevelWin(curwin, lnum);                                           |
+  {7: }}                                                                              |
+  {2:[No Name] [+]                                                                   }|
+                                                                                  |
+  ]],
+      })
+    end)
+
+    it('remains valid after the client re-attaches.', function()
+      exec_lua(function()
+        vim.lsp.buf_detach_client(bufnr, client_id)
+        vim.lsp.buf_attach_client(bufnr, client_id)
+      end)
+      screen:expect({
+        grid = [[
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {3:[No Name] [+]                                                                   }|
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }}                                                                              |
+  {2:[No Name] [+]                                                                   }|
+                                                                                  |
+  ]],
+      })
+    end)
+  end)
+
+  describe('foldtext()', function()
+    --- @type test.functional.ui.screen
+    local screen
+    before_each(function()
+      screen = Screen.new(80, 23)
+      command(
+        [[set foldexpr=v:lua.vim.lsp.foldexpr() foldtext=v:lua.vim.lsp.foldtext() foldlevel=1]]
+      )
+    end)
+
+    it('shows the first folded line if `collapsedText` does not exist', function()
+      screen:expect({
+        grid = [[
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:+}{13:  // While updating the folds lines between invalid_top and invalid_bot have···}|
+  {7:+}{13:  if (invalid_top == 0) {······················································}|
+  {7:+}{13:  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {························}|
+  {7:+}{13:  } else if (lnum >= invalid_top && lnum <= invalid_bot) {·····················}|
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:+}{13:  if (!hasAnyFolding(curwin)) {················································}|
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {1:~                                                                               }|*6
+                                                                                  |
+  ]],
+      })
+    end)
+
+    it('shows the foldtext by virt line', function()
+      command([[set filetype=c]])
+      eq(
+        {
+          { '  ' },
+          { 'if', { '@keyword.conditional.c' } },
+          { ' ' },
+          { '(', { '@punctuation.bracket.c' } },
+          { '!', { '@operator.c' } },
+          { 'hasAnyFolding', { '@variable.c', '@function.call.c' } },
+          { '(', { '@punctuation.bracket.c' } },
+          { 'curwin', { '@variable.c' } },
+          { ')', { '@punctuation.bracket.c' } },
+          { ')', { '@punctuation.bracket.c' } },
+          { ' ' },
+          { '{', { '@punctuation.bracket.c' } },
+        },
+        exec_lua(function()
+          return vim.lsp.foldtext(16)
+        end)
+      )
+    end)
+  end)
+
+  describe('foldclose()', function()
+    --- @type test.functional.ui.screen
+    local screen
+    before_each(function()
+      screen = Screen.new(80, 23)
+      command([[set foldexpr=v:lua.vim.lsp.foldexpr()]])
+    end)
+
+    it('closes all folds of one kind immediately', function()
+      exec_lua(function()
+        vim.lsp.foldclose('comment')
+      end)
+      screen:expect({
+        grid = [[
+  {7:+}{13:+--  2 lines: foldLevel()······················································}|
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:+}{13:+---  2 lines: While updating the folds lines between invalid_top and invalid_b}|
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {1:~                                                                               }|*3
+                                                                                  |
+  ]],
+      })
+    end)
+
+    it('closes the smallest fold first', function()
+      exec_lua(function()
+        vim.lsp.foldclose('region')
+      end)
+      screen:expect({
+        grid = [[
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:+}{13:+-- 17 lines: {································································}|
+  {7: }^}                                                                              |
+  {1:~                                                                               }|*17
+                                                                                  |
+  ]],
+      })
+      command('4foldopen')
+      screen:expect({
+        grid = [[
+  {7:-}// foldLevel() {{{2                                                            |
+  {7:│}/// @return  fold level at line number "lnum" in the current window.           |
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:-}  // While updating the folds lines between invalid_top and invalid_bot have   |
+  {7:2}  // an undefined fold level.  Otherwise update the folds first.               |
+  {7:+}{13:+---  2 lines: if (invalid_top == 0) {·········································}|
+  {7:+}{13:+---  2 lines: } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {···········}|
+  {7:+}{13:+---  2 lines: } else if (lnum >= invalid_top && lnum <= invalid_bot) {········}|
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:+}{13:+---  2 lines: if (!hasAnyFolding(curwin)) {···································}|
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {1:~                                                                               }|*5
+                                                                                  |
+  ]],
+      })
+    end)
+
+    it('is deferred when the buffer is not up-to-date', function()
+      exec_lua(function()
+        vim.lsp.foldclose('comment')
+        vim.lsp.util.buf_versions[bufnr] = 0
+      end)
+      screen:expect({
+        grid = [[
+  {7:+}{13:+--  2 lines: foldLevel()······················································}|
+  {7: }static int foldLevel(linenr_T lnum)                                            |
+  {7:-}{                                                                              |
+  {7:+}{13:+---  2 lines: While updating the folds lines between invalid_top and invalid_b}|
+  {7:-}  if (invalid_top == 0) {                                                      |
+  {7:2}    checkupdate(curwin);                                                       |
+  {7:-}  } else if (lnum == prev_lnum && prev_lnum_lvl >= 0) {                        |
+  {7:2}    return prev_lnum_lvl;                                                      |
+  {7:-}  } else if (lnum >= invalid_top && lnum <= invalid_bot) {                     |
+  {7:2}    return -1;                                                                 |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  // Return quickly when there is no folding at all in this window.            |
+  {7:-}  if (!hasAnyFolding(curwin)) {                                                |
+  {7:2}    return 0;                                                                  |
+  {7:│}  }                                                                            |
+  {7:│}                                                                               |
+  {7:│}  return foldLevelWin(curwin, lnum);                                           |
+  {7: }^}                                                                              |
+  {1:~                                                                               }|*3
+                                                                                  |
+  ]],
+      })
+    end)
+  end)
+end)
+
+describe('vim.lsp nested folding ranges', function()
+  local bufnr ---@type integer
+
+  local function start_server(text, ranges)
+    insert(text)
+    exec_lua(function(ranges)
+      _G.server = _G._create_server({
+        capabilities = {
+          foldingRangeProvider = true,
+        },
+        handlers = {
+          ['textDocument/foldingRange'] = function(_, _, callback)
+            callback(nil, ranges)
+          end,
+        },
+      })
+
+      vim.api.nvim_win_set_buf(0, bufnr)
+      vim.lsp.start({ name = 'dummy', cmd = _G.server.cmd })
+    end, ranges)
+    command(
+      [[set foldmethod=expr foldexpr=v:lua.vim.lsp.foldexpr() foldtext=v:lua.vim.lsp.foldtext() foldminlines=0]]
+    )
+  end
+
+  before_each(function()
+    clear_notrace()
+    exec_lua(create_server_definition)
+    bufnr = api.nvim_get_current_buf()
+  end)
+  after_each(function()
+    api.nvim_exec_autocmds('VimLeavePre', { modeline = false })
+  end)
+
+  it('uses the outermost level when nested ranges end on the same row', function()
+    start_server(
+      dedent([=[
+        local function first()
+          return {
+            child = {
+              value = true,
+            } } end; local function second() return {
+          child = {
+            value = false,
+          },
+        }
+        end
+      ]=]),
+      {
+        { startLine = 0, endLine = 3, kind = 'region' },
+        { startLine = 4, endLine = 8, kind = 'region' },
+        { startLine = 1, endLine = 3, kind = 'region' },
+        { startLine = 4, endLine = 7, kind = 'region' },
+        { startLine = 2, endLine = 3, kind = 'region' },
+        { startLine = 5, endLine = 6, kind = 'region' },
+      }
+    )
+
+    retry(nil, nil, function()
+      eq(
+        { '>1', '>2', '>3', '<1', '>2', '>3', '<3', '<2', '<1', '0' },
+        exec_lua(function()
+          local levels = {}
+          for lnum = 1, 10 do
+            levels[lnum] = vim.lsp.foldexpr(lnum)
+          end
+          return levels
+        end)
+      )
+    end)
+
+    exec_lua(function()
+      vim._foldupdate(vim.api.nvim_get_current_win(), 0, vim.api.nvim_buf_line_count(0))
+    end)
+    command('normal! zM')
+    eq(
+      { 1, 4, 5, 9 },
+      exec_lua(function()
+        return {
+          vim.fn.foldclosed(1),
+          vim.fn.foldclosedend(1),
+          vim.fn.foldclosed(5),
+          vim.fn.foldclosedend(5),
+        }
+      end)
+    )
+  end)
+
+  it('prefers a fold start when ranges end and start on the same row', function()
+    start_server('one\ntwo\nthree\nfour\nfive', {
+      { startLine = 0, endLine = 4 },
+      { startLine = 2, endLine = 4 },
+      { startLine = 0, endLine = 2 },
+    })
+
+    retry(nil, nil, function()
+      eq(
+        { '>2', '2', '>3', '2', '<1' },
+        exec_lua(function()
+          local levels = {}
+          for lnum = 1, 5 do
+            levels[lnum] = vim.lsp.foldexpr(lnum)
+          end
+          return levels
+        end)
+      )
+    end)
+  end)
+end)

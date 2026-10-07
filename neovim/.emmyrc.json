@@ -1,0 +1,65 @@
+{
+  "$schema": "https://raw.githubusercontent.com/EmmyLuaLs/emmylua-analyzer-rust/0.25.1/crates/emmylua_code_analysis/resources/schema.json",
+  "runtime": {
+    "version": "LuaJIT"
+  },
+  "workspace": {
+    "ignoreDir": [
+      ".deps",
+      "build"
+    ],
+    "ignoreGlobs": [
+      "**/example_init.lua",
+      "**/lua/vim/re.lua",
+      "test/**/fixtures/**"
+    ],
+    "preloadFileSize": 1000
+  },
+  "format": {
+    "externalTool": {
+      "program": "stylua",
+      "args": [
+        "-",
+        "--stdin-filepath",
+        "${file}"
+      ]
+    }
+  },
+  "diagnostics": {
+    "disable": [
+      "incomplete-signature-doc",
+      "iter-variable-reassign",
+      "unnecessary-if"
+    ],
+    "severity": {
+      "deprecated": "warning",
+      "duplicate-require": "warning",
+      "preferred-local-alias": "warning",
+      "redefined-local": "warning",
+      "unreachable-code": "warning",
+      "unused": "warning"
+    },
+    "enables": [
+      "code-style-check",
+      "missing-global-doc",
+      "non-literal-expressions-in-assert",
+      "unknown-doc-tag"
+    ]
+  },
+  "codeAction": {
+    "insertSpace": true
+  },
+  "strict": {
+    "typeCall": true,
+    "arrayIndex": true
+  },
+  "doc": {
+    "knownTags": [
+      "brief",
+      "inlinedoc",
+      "nodoc",
+      "note",
+      "since"
+    ]
+  }
+}

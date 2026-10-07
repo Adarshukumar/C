@@ -1,0 +1,384 @@
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
+
+local describe, it, before_each = t.describe, t.it, t.before_each
+local api = n.api
+local fn = n.fn
+local clear = n.clear
+local eq = t.eq
+local exec_lua = n.exec_lua
+local feed = n.feed
+
+local function get_selected()
+  return table.concat(fn.getregion(fn.getpos('v'), fn.getpos('.')), '\n')
+end
+
+local function set_lines(lines)
+  if type(lines) == 'string' then
+    lines = vim.split(lines, '\n')
+  end
+  api.nvim_buf_set_lines(0, 0, -1, true, lines)
+end
+
+local function set_filetype(ft)
+  api.nvim_set_option_value('filetype', ft, { buf = 0 })
+end
+
+local function treeselect(cmd_, count_)
+  exec_lua(function(cmd, count)
+    vim.treesitter.select(cmd, count)
+  end, cmd_, count_)
+end
+
+describe('treesitter incremental-selection', function()
+  before_each(function()
+    clear()
+
+    local code = {
+      '',
+      'foo(1)',
+      'bar(2)',
+      '',
+    }
+
+    set_lines(code)
+    set_filetype('lua')
+    feed('G')
+  end)
+
+  it('works', function()
+    treeselect('child')
+    eq('foo(1)\nbar(2)\n', get_selected())
+
+    treeselect('child')
+    eq('foo(1)', get_selected())
+
+    treeselect('next')
+    eq('bar(2)', get_selected())
+
+    treeselect('prev')
+    eq('foo(1)', get_selected())
+
+    treeselect('parent')
+    eq('foo(1)\nbar(2)\n', get_selected())
+
+    set_lines('quux(1,foo,bar,baz,qux,2)')
+    feed('<esc>fbve')
+    eq('bar', get_selected())
+
+    treeselect('extend_next')
+    eq('bar,baz', get_selected())
+
+    treeselect('extend_prev')
+    eq('foo,bar,baz', get_selected())
+
+    -- Operator-pending (|omap-info| textobj) does not clobber '< '>. #40949
+    exec_lua(function()
+      vim.keymap.set('o', 'an', function()
+        vim.treesitter.select('parent', vim.v.count1)
+      end)
+    end)
+    feed('<Esc>0v<Esc>')
+    local vmarks = { fn.getpos("'<"), fn.getpos("'>"), 'v' }
+    feed('fbyan')
+    eq('bar', fn.getreg('"'))
+    eq(vmarks, { fn.getpos("'<"), fn.getpos("'>"), fn.visualmode() }) -- '< '> are unchanged.
+
+    -- selection=exclusive: the cursor char is the start, like "inclusive".
+    api.nvim_set_option_value('selection', 'exclusive', {})
+    feed('f2yan')
+    eq('(1,foo,bar,baz,qux,2)', fn.getreg('"'))
+  end)
+
+  it('repeat', function()
+    set_lines('foo(1,2,3,4)')
+    treeselect('child')
+    eq('foo', get_selected())
+    treeselect('next')
+    eq('(1,2,3,4)', get_selected())
+    treeselect('parent')
+    eq('foo(1,2,3,4)', get_selected())
+
+    treeselect('child', 2)
+    eq('1', get_selected())
+
+    treeselect('next', 3)
+    eq('4', get_selected())
+
+    treeselect('prev', 2)
+    eq('2', get_selected())
+
+    treeselect('parent', 2)
+    eq('foo(1,2,3,4)', get_selected())
+
+    treeselect('child', 2)
+    eq('2', get_selected())
+
+    feed('<esc>F1')
+    treeselect('extend_next', 2)
+    eq('1,2,3', get_selected())
+
+    feed('<esc>f4v')
+    treeselect('extend_prev', 2)
+    eq('2,3,4', get_selected())
+  end)
+
+  it('history', function()
+    treeselect('child')
+    treeselect('child')
+    treeselect('next')
+
+    eq('bar(2)', get_selected())
+    treeselect('parent')
+    eq('foo(1)\nbar(2)\n', get_selected())
+    treeselect('child')
+    eq('bar(2)', get_selected())
+
+    treeselect('prev')
+
+    eq('foo(1)', get_selected())
+    treeselect('parent')
+    eq('foo(1)\nbar(2)\n', get_selected())
+    treeselect('child')
+    eq('foo(1)', get_selected())
+  end)
+
+  it('selects node as parent when node half-selected', function()
+    feed('kkl', 'v', 'l')
+    eq('oo', get_selected())
+
+    treeselect('parent')
+    eq('foo', get_selected())
+  end)
+
+  it('selects node as child when node half-selected', function()
+    feed('kkl', 'v', 'l')
+    eq('oo', get_selected())
+
+    treeselect('child')
+    eq('foo', get_selected())
+  end)
+
+  it('finds child node when node half-selected', function()
+    feed('kkl', 'v', 'j')
+    eq('oo(1)\nba', get_selected())
+
+    treeselect('child')
+    eq('(1)', get_selected())
+  end)
+
+  it('maintains cursor selection-end-pos', function()
+    feed('kk')
+    treeselect('child')
+    eq('foo', get_selected())
+
+    treeselect('parent')
+    feed('h')
+    eq('foo(1', get_selected())
+
+    treeselect('child')
+    eq('foo', get_selected())
+
+    feed('o')
+    treeselect('parent')
+    feed('l')
+    eq('oo(1)', get_selected())
+  end)
+
+  it('handles outside root node', function()
+    feed('gg', 'v')
+    eq('', get_selected())
+
+    treeselect('child')
+    eq('foo(1)\nbar(2)\n', get_selected())
+
+    feed('<esc>gg', 'v')
+    eq('', get_selected())
+
+    treeselect('child')
+    eq('foo(1)\nbar(2)\n', get_selected())
+
+    feed('<esc>gg', 'v')
+    eq('', get_selected())
+
+    treeselect('parent')
+    eq('foo(1)\nbar(2)\n', get_selected())
+  end)
+
+  it('handles unicode', function()
+    set_lines {
+      '',
+      'foo("abö")',
+      '',
+    }
+
+    feed('gg', 'jfb', 'v')
+    treeselect('child')
+    eq('abö', get_selected())
+
+    treeselect('parent')
+    eq('"abö"', get_selected())
+  end)
+end)
+
+describe('treesitter incremental-selection with injections', function()
+  before_each(function()
+    clear({ args_rm = { '--cmd' }, args = { '--clean', '--cmd', n.runtime_set } })
+  end)
+
+  it('works', function()
+    set_lines('```lua\ndo foo() end\n```')
+    set_filetype('markdown')
+    feed('gg0')
+    treeselect('child')
+    treeselect('parent')
+    eq('```lua\ndo foo() end\n```', get_selected())
+
+    treeselect('child')
+    treeselect('next')
+    treeselect('next')
+    treeselect('child')
+    treeselect('child')
+    treeselect('child')
+
+    eq('foo', get_selected())
+
+    treeselect('parent')
+    treeselect('parent')
+    treeselect('parent')
+    treeselect('prev')
+
+    eq('lua', get_selected())
+
+    treeselect('next')
+    treeselect('next')
+
+    eq('```', get_selected())
+  end)
+
+  it('ignores overlapping nodes', function()
+    do
+      -- Check that, if injections are disabled, there are nodes overlapping the injection
+      exec_lua(function()
+        vim.treesitter.query.set('vimdoc', 'injections', '')
+        vim.cmd.enew()
+      end)
+
+      set_filetype('help')
+      set_lines('>lua\n \n foo(\n )')
+
+      feed('G0')
+      treeselect('child')
+      eq(' )', get_selected())
+      treeselect('prev')
+      eq(' foo(', get_selected())
+
+      exec_lua(function()
+        vim.treesitter.query.set('vimdoc', 'injections', ';; extends')
+        vim.cmd.enew()
+      end)
+    end
+
+    set_filetype('help')
+    set_lines('>lua\n \n foo(\n )')
+
+    feed('G0')
+    treeselect('child')
+    eq('(\n )', get_selected())
+    treeselect('parent')
+    treeselect('parent')
+    eq('foo(\n )', get_selected())
+
+    -- There will be one out of the siblings that wont be covered:
+    treeselect('prev')
+    eq(' ', get_selected())
+  end)
+
+  it('ignores overlapping injections', function()
+    exec_lua(function()
+      vim.treesitter.query.set(
+        'lua',
+        'injections',
+        [[
+      (comment
+        content: (_) @injection.content
+        (#set! injection.language "vim")
+        (#offset! @injection.content 0 1 0 -3))
+      (comment
+        content: (_) @injection.content
+        (#set! injection.language "c")
+        (#offset! @injection.content 0 2 0 0))
+      ]]
+      )
+      vim.cmd.enew()
+    end)
+
+    -- What the above query does is create the injections as follows (v=vim, c=c):
+    --             vvvv
+    --              cccccc
+    --          -- edit();
+
+    set_filetype('lua')
+    set_lines({ '-- edit();' })
+    feed('gg0lll')
+    treeselect('child')
+    if get_selected() == 'edit' then
+      -- It is random which injection gets higher priority,
+      --   as the priority uses the treesitter-node's id as a priority
+      --  So reverse the priority if not favorable
+      exec_lua("require'vim.treesitter._select'.TEST_SWITCH_PRIORITY=true")
+    end
+
+    feed('<esc>gg0lll')
+    treeselect('child')
+    eq(' edit();', get_selected())
+    treeselect('child')
+    eq('dit();', get_selected())
+    treeselect('prev') -- should do nothing
+    eq('dit();', get_selected())
+
+    exec_lua(
+      "require'vim.treesitter._select'.TEST_SWITCH_PRIORITY=not require'vim.treesitter._select'.TEST_SWITCH_PRIORITY"
+    )
+    feed('<esc>gg0lll')
+    treeselect('child')
+    eq('edit', get_selected())
+    treeselect('next') -- should do nothing
+    eq('edit', get_selected())
+  end)
+
+  it('handles disjointed trees', function()
+    exec_lua(function()
+      vim.treesitter.query.set(
+        'lua',
+        'injections',
+        [[
+      (comment
+        content: (_) @injection.content
+        (#set! injection.language "c")
+        (#set! injection.combined))
+      ]]
+      )
+      vim.cmd.enew()
+    end)
+
+    set_filetype('lua')
+    set_lines({ '--int foo={', '--1};' })
+    feed('gg$')
+
+    treeselect('child')
+    eq('{', get_selected())
+    treeselect('parent')
+    treeselect('parent')
+    treeselect('parent')
+    eq('--int foo={', get_selected())
+
+    treeselect('next')
+    eq('--1};', get_selected())
+    treeselect('child')
+    treeselect('child')
+    eq('1}', get_selected())
+    treeselect('prev') -- should do nothing
+    eq('1}', get_selected())
+  end)
+end)

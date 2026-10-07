@@ -1,0 +1,3059 @@
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
+local Screen = require('test.functional.ui.screen')
+
+local describe, it, before_each, after_each, setup, teardown, finally =
+  t.describe, t.it, t.before_each, t.after_each, t.setup, t.teardown, t.finally
+local clear = n.clear
+local eq = t.eq
+local ok = t.ok
+local describe_lua_and_rpc = n.describe_lua_and_rpc(describe)
+local api = n.api
+local fn = n.fn
+local request = n.request
+local exec, exec_lua = n.exec, n.exec_lua
+local insert = n.insert
+local NIL = vim.NIL
+local command = n.command
+local feed = n.feed
+local pcall_err = t.pcall_err
+local assert_alive = n.assert_alive
+
+describe('api/buf', function()
+  before_each(clear)
+
+  -- access deprecated functions
+  local function curbuf_depr(method, ...)
+    return request('buffer_' .. method, 0, ...)
+  end
+
+  describe('nvim_buf_set_lines, nvim_buf_line_count', function()
+    it('deprecated forms', function()
+      eq(1, curbuf_depr('line_count'))
+      curbuf_depr('insert', -1, { 'line' })
+      eq(2, curbuf_depr('line_count'))
+      curbuf_depr('insert', -1, { 'line' })
+      eq(3, curbuf_depr('line_count'))
+      curbuf_depr('del_line', -1)
+      eq(2, curbuf_depr('line_count'))
+      curbuf_depr('del_line', -1)
+      curbuf_depr('del_line', -1)
+      -- There's always at least one line
+      eq(1, curbuf_depr('line_count'))
+    end)
+
+    it("doesn't crash just after set undolevels=1 #24894", function()
+      local buf = api.nvim_create_buf(false, true)
+      api.nvim_set_option_value('undolevels', -1, { buf = buf })
+      api.nvim_buf_set_lines(buf, 0, 1, false, {})
+
+      assert_alive()
+    end)
+
+    it('cursor position is maintained after lines are inserted #9961', function()
+      -- replace the buffer contents with these three lines.
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'line1', 'line2', 'line3', 'line4' })
+      -- Set the current cursor to {3, 2}.
+      api.nvim_win_set_cursor(0, { 3, 2 })
+
+      -- add 2 lines and delete 1 line above the current cursor position.
+      api.nvim_buf_set_lines(0, 1, 2, true, { 'line5', 'line6' })
+      -- check the current set of lines in the buffer.
+      eq({ 'line1', 'line5', 'line6', 'line3', 'line4' }, api.nvim_buf_get_lines(0, 0, -1, true))
+      -- cursor should be moved below by 1 line.
+      eq({ 4, 2 }, api.nvim_win_get_cursor(0))
+
+      -- add a line after the current cursor position.
+      api.nvim_buf_set_lines(0, 5, 5, true, { 'line7' })
+      -- check the current set of lines in the buffer.
+      eq(
+        { 'line1', 'line5', 'line6', 'line3', 'line4', 'line7' },
+        api.nvim_buf_get_lines(0, 0, -1, true)
+      )
+      -- cursor position is unchanged.
+      eq({ 4, 2 }, api.nvim_win_get_cursor(0))
+
+      -- overwrite current cursor line.
+      api.nvim_buf_set_lines(0, 3, 5, true, { 'line8', 'line9' })
+      -- check the current set of lines in the buffer.
+      eq(
+        { 'line1', 'line5', 'line6', 'line8', 'line9', 'line7' },
+        api.nvim_buf_get_lines(0, 0, -1, true)
+      )
+      -- cursor position is unchanged.
+      eq({ 4, 2 }, api.nvim_win_get_cursor(0))
+
+      -- delete current cursor line.
+      api.nvim_buf_set_lines(0, 3, 5, true, {})
+      -- check the current set of lines in the buffer.
+      eq({ 'line1', 'line5', 'line6', 'line7' }, api.nvim_buf_get_lines(0, 0, -1, true))
+      -- cursor position is unchanged.
+      eq({ 4, 2 }, api.nvim_win_get_cursor(0))
+    end)
+
+    it('cursor position is maintained in non-current window', function()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'line1', 'line2', 'line3', 'line4' })
+      api.nvim_win_set_cursor(0, { 3, 2 })
+      local win = api.nvim_get_current_win()
+      local buf = api.nvim_get_current_buf()
+
+      command('new')
+
+      api.nvim_buf_set_lines(buf, 1, 2, true, { 'line5', 'line6' })
+      eq({ 'line1', 'line5', 'line6', 'line3', 'line4' }, api.nvim_buf_get_lines(buf, 0, -1, true))
+      eq({ 4, 2 }, api.nvim_win_get_cursor(win))
+    end)
+
+    it('cursor position is maintained in TWO non-current windows', function()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'line1', 'line2', 'line3', 'line4' })
+      api.nvim_win_set_cursor(0, { 3, 2 })
+      local win = api.nvim_get_current_win()
+      local buf = api.nvim_get_current_buf()
+
+      command('split')
+      api.nvim_win_set_cursor(0, { 4, 2 })
+      local win2 = api.nvim_get_current_win()
+
+      -- set current window to third one with another buffer
+      command('new')
+
+      api.nvim_buf_set_lines(buf, 1, 2, true, { 'line5', 'line6' })
+      eq({ 'line1', 'line5', 'line6', 'line3', 'line4' }, api.nvim_buf_get_lines(buf, 0, -1, true))
+      eq({ 4, 2 }, api.nvim_win_get_cursor(win))
+      eq({ 5, 2 }, api.nvim_win_get_cursor(win2))
+    end)
+
+    it('cursor position is maintained consistently with viewport', function()
+      local screen = Screen.new(20, 12)
+
+      local lines = { 'line1', 'line2', 'line3', 'line4', 'line5', 'line6' }
+      local buf = api.nvim_get_current_buf()
+
+      api.nvim_buf_set_lines(buf, 0, -1, true, lines)
+
+      command('6')
+      command('new')
+      screen:expect {
+        grid = [[
+        ^                    |
+        {1:~                   }|*4
+        {3:[No Name]           }|
+        line5               |
+        line6               |
+        {1:~                   }|*2
+        {2:[No Name] [+]       }|
+                            |
+      ]],
+      }
+
+      lines[5] = 'boogalo 5'
+      api.nvim_buf_set_lines(buf, 0, -1, true, lines)
+      screen:expect {
+        grid = [[
+        ^                    |
+        {1:~                   }|*4
+        {3:[No Name]           }|
+        boogalo 5           |
+        line6               |
+        {1:~                   }|*2
+        {2:[No Name] [+]       }|
+                            |
+      ]],
+      }
+
+      command('wincmd w')
+      screen:expect {
+        grid = [[
+                            |
+        {1:~                   }|*4
+        {2:[No Name]           }|
+        boogalo 5           |
+        ^line6               |
+        {1:~                   }|*2
+        {3:[No Name] [+]       }|
+                            |
+      ]],
+      }
+    end)
+
+    it('line_count has defined behaviour for unloaded buffers', function()
+      -- we'll need to know our bufnr for when it gets unloaded
+      local bufnr = api.nvim_get_current_buf()
+      -- replace the buffer contents with these three lines
+      api.nvim_buf_set_lines(bufnr, 0, -1, true, { 'line1', 'line2', 'line3', 'line4' })
+      -- check the line count is correct
+      eq(4, api.nvim_buf_line_count(bufnr))
+      -- force unload the buffer (this will discard changes)
+      command('new')
+      command('bunload! ' .. bufnr)
+      -- line count for an unloaded buffer should always be 0
+      eq(0, api.nvim_buf_line_count(bufnr))
+    end)
+
+    it('get_lines and get_text has defined behaviour for unloaded buffers', function()
+      -- we'll need to know our bufnr for when it gets unloaded
+      local bufnr = api.nvim_get_current_buf()
+      -- replace the buffer contents with these three lines
+      api.nvim_buf_set_lines(bufnr, 0, -1, true, { 'line1', 'line2', 'line3', 'line4' })
+      -- confirm that getting lines works
+      eq({ 'line2', 'line3' }, api.nvim_buf_get_lines(bufnr, 1, 3, true))
+      -- force unload the buffer (this will discard changes)
+      command('new')
+      command('bunload! ' .. bufnr)
+      -- attempting to get lines now always gives empty list
+      eq({}, api.nvim_buf_get_lines(bufnr, 1, 3, true))
+      -- it's impossible to get out-of-bounds errors for an unloaded buffer
+      eq({}, api.nvim_buf_get_lines(bufnr, 8888, 9999, true))
+      eq({}, api.nvim_buf_get_text(bufnr, 8888, 1000, 9999, 2000, {}))
+      -- The Lua path (vim.api) must also return an empty table, not nil. #39833 #39851
+      eq(
+        { 'table', {} },
+        exec_lua(function()
+          local r = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+          return { type(r), r }
+        end)
+      )
+      eq(
+        { 'table', {} },
+        exec_lua(function()
+          local r = vim.api.nvim_buf_get_text(bufnr, 0, 0, -1, 0, {})
+          return { type(r), r }
+        end)
+      )
+    end)
+
+    describe('handles topline', function()
+      local screen
+      before_each(function()
+        screen = Screen.new(20, 12)
+        api.nvim_buf_set_lines(
+          0,
+          0,
+          -1,
+          true,
+          { 'aaa', 'bbb', 'ccc', 'ddd', 'www', 'xxx', 'yyy', 'zzz' }
+        )
+        api.nvim_set_option_value('modified', false, {})
+      end)
+
+      it('of current window', function()
+        local win = api.nvim_get_current_win()
+        local buf = api.nvim_get_current_buf()
+
+        command('new | wincmd w')
+        api.nvim_win_set_cursor(win, { 8, 0 })
+
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          ^zzz                 |
+          {3:[No Name]           }|
+                              |
+        ]],
+        }
+
+        api.nvim_buf_set_lines(buf, 0, 2, true, { 'aaabbb' })
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          ^zzz                 |
+          {3:[No Name] [+]       }|
+                              |
+        ]],
+        }
+
+        -- replacing topline keeps it the topline
+        api.nvim_buf_set_lines(buf, 3, 4, true, { 'wwweeee' })
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          wwweeee             |
+          xxx                 |
+          yyy                 |
+          ^zzz                 |
+          {3:[No Name] [+]       }|
+                              |
+        ]],
+        }
+
+        -- inserting just before topline does not scroll up if cursor would be moved
+        api.nvim_buf_set_lines(buf, 3, 3, true, { 'mmm' })
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          wwweeee             |
+          xxx                 |
+          yyy                 |
+          ^zzz                 |
+          {3:[No Name] [+]       }|
+                              |
+        ]],
+          unchanged = true,
+        }
+
+        api.nvim_win_set_cursor(0, { 7, 0 })
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          wwweeee             |
+          xxx                 |
+          ^yyy                 |
+          zzz                 |
+          {3:[No Name] [+]       }|
+                              |
+        ]],
+        }
+
+        api.nvim_buf_set_lines(buf, 4, 4, true, { 'mmmeeeee' })
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          mmmeeeee            |
+          wwweeee             |
+          xxx                 |
+          ^yyy                 |
+          {3:[No Name] [+]       }|
+                              |
+        ]],
+        }
+      end)
+
+      it('of non-current window', function()
+        local win = api.nvim_get_current_win()
+        local buf = api.nvim_get_current_buf()
+
+        command('new')
+        api.nvim_win_set_cursor(win, { 8, 0 })
+
+        screen:expect {
+          grid = [[
+          ^                    |
+          {1:~                   }|*4
+          {3:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name]           }|
+                              |
+        ]],
+        }
+
+        api.nvim_buf_set_lines(buf, 0, 2, true, { 'aaabbb' })
+        screen:expect {
+          grid = [[
+          ^                    |
+          {1:~                   }|*4
+          {3:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+        }
+
+        -- replacing topline keeps it the topline
+        api.nvim_buf_set_lines(buf, 3, 4, true, { 'wwweeee' })
+        screen:expect {
+          grid = [[
+          ^                    |
+          {1:~                   }|*4
+          {3:[No Name]           }|
+          wwweeee             |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+        }
+
+        api.nvim_buf_set_lines(buf, 3, 3, true, { 'mmm' })
+        screen:expect {
+          grid = [[
+          ^                    |
+          {1:~                   }|*4
+          {3:[No Name]           }|
+          wwweeee             |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+          unchanged = true,
+        }
+      end)
+
+      it('of split windows with same buffer', function()
+        local win = api.nvim_get_current_win()
+        local buf = api.nvim_get_current_buf()
+
+        command('split')
+        api.nvim_win_set_cursor(win, { 8, 0 })
+        api.nvim_win_set_cursor(0, { 1, 0 })
+
+        screen:expect {
+          grid = [[
+          ^aaa                 |
+          bbb                 |
+          ccc                 |
+          ddd                 |
+          www                 |
+          {3:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name]           }|
+                              |
+        ]],
+        }
+        api.nvim_buf_set_lines(buf, 0, 2, true, { 'aaabbb' })
+
+        screen:expect {
+          grid = [[
+          ^aaabbb              |
+          ccc                 |
+          ddd                 |
+          www                 |
+          xxx                 |
+          {3:[No Name] [+]       }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+        }
+
+        -- replacing topline keeps it the topline
+        api.nvim_buf_set_lines(buf, 3, 4, true, { 'wwweeee' })
+        screen:expect {
+          grid = [[
+          ^aaabbb              |
+          ccc                 |
+          ddd                 |
+          wwweeee             |
+          xxx                 |
+          {3:[No Name] [+]       }|
+          wwweeee             |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+        }
+
+        api.nvim_buf_set_lines(buf, 3, 3, true, { 'mmm' })
+        screen:expect {
+          grid = [[
+          ^aaabbb              |
+          ccc                 |
+          ddd                 |
+          mmm                 |
+          wwweeee             |
+          {3:[No Name] [+]       }|
+          wwweeee             |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+        }
+      end)
+
+      describe('of current window when', function()
+        before_each(function()
+          command('new | wincmd w | setlocal modified')
+          feed('Gk')
+          screen:expect([[
+                                |
+            {1:~                   }|*4
+            {2:[No Name]           }|
+            www                 |
+            xxx                 |
+            ^yyy                 |
+            zzz                 |
+            {3:[No Name] [+]       }|
+                                |
+          ]])
+        end)
+
+        it('deleting 3 lines around topline', function()
+          api.nvim_buf_set_lines(0, 3, 6, true, {})
+          screen:expect([[
+                                |
+            {1:~                   }|*4
+            {2:[No Name]           }|
+            ccc                 |
+            ^yyy                 |
+            zzz                 |
+            {1:~                   }|
+            {3:[No Name] [+]       }|
+                                |
+          ]])
+          eq(5, api.nvim_buf_line_count(0))
+        end)
+
+        it('deleting 3 lines around the line just before topline', function()
+          api.nvim_buf_set_lines(0, 2, 5, true, {})
+          screen:expect([[
+                                |
+            {1:~                   }|*4
+            {2:[No Name]           }|
+            bbb                 |
+            xxx                 |
+            ^yyy                 |
+            zzz                 |
+            {3:[No Name] [+]       }|
+                                |
+          ]])
+          eq(5, api.nvim_buf_line_count(0))
+        end)
+
+        for count = 1, 4 do
+          it(('deleting %d lines just before topline'):format(count), function()
+            api.nvim_buf_set_lines(0, 4 - count, 4, true, {})
+            screen:expect_unchanged()
+            eq(8 - count, api.nvim_buf_line_count(0))
+          end)
+
+          it(('replacing %d lines just before topline with 2 lines'):format(count), function()
+            api.nvim_buf_set_lines(0, 4 - count, 4, true, { 'eee', 'fff' })
+            screen:expect_unchanged()
+            eq(8 - count + 2, api.nvim_buf_line_count(0))
+          end)
+        end
+
+        for count = 1, 3 do
+          it(('deleting %d lines far before topline'):format(count), function()
+            api.nvim_buf_set_lines(0, 0, count, true, {})
+            screen:expect_unchanged()
+            eq(8 - count, api.nvim_buf_line_count(0))
+          end)
+
+          it(('replacing %d lines far before topline with 2 lines'):format(count), function()
+            api.nvim_buf_set_lines(0, 0, count, true, { 'eee', 'fff' })
+            screen:expect_unchanged()
+            eq(8 - count + 2, api.nvim_buf_line_count(0))
+          end)
+        end
+      end)
+    end)
+
+    it('handles clearing out non-current buffer #24911', function()
+      local buf = api.nvim_get_current_buf()
+      api.nvim_buf_set_lines(buf, 0, -1, true, { 'aaa', 'bbb', 'ccc' })
+      command('new')
+
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'xxx', 'yyy', 'zzz' })
+
+      api.nvim_buf_set_lines(buf, 0, -1, true, {})
+      eq({ 'xxx', 'yyy', 'zzz' }, api.nvim_buf_get_lines(0, 0, -1, true))
+      eq({ '' }, api.nvim_buf_get_lines(buf, 0, -1, true))
+    end)
+  end)
+
+  describe('deprecated: {get,set,del}_line', function()
+    it('works', function()
+      eq('', curbuf_depr('get_line', 0))
+      curbuf_depr('set_line', 0, 'line1')
+      eq('line1', curbuf_depr('get_line', 0))
+      curbuf_depr('set_line', 0, 'line2')
+      eq('line2', curbuf_depr('get_line', 0))
+      curbuf_depr('del_line', 0)
+      eq('', curbuf_depr('get_line', 0))
+    end)
+
+    it('get_line: out-of-bounds is an error', function()
+      curbuf_depr('set_line', 0, 'line1.a')
+      eq(1, curbuf_depr('line_count')) -- sanity
+      eq(false, pcall(curbuf_depr, 'get_line', 1))
+      eq(false, pcall(curbuf_depr, 'get_line', -2))
+    end)
+
+    it('set_line, del_line: out-of-bounds is an error', function()
+      curbuf_depr('set_line', 0, 'line1.a')
+      eq(false, pcall(curbuf_depr, 'set_line', 1, 'line1.b'))
+      eq(false, pcall(curbuf_depr, 'set_line', -2, 'line1.b'))
+      eq(false, pcall(curbuf_depr, 'del_line', 2))
+      eq(false, pcall(curbuf_depr, 'del_line', -3))
+    end)
+
+    it('can handle NULs', function()
+      curbuf_depr('set_line', 0, 'ab\0cd')
+      eq('ab\0cd', curbuf_depr('get_line', 0))
+    end)
+  end)
+
+  describe('deprecated: {get,set}_line_slice', function()
+    it('get_line_slice: out-of-bounds returns empty array', function()
+      curbuf_depr('set_line_slice', 0, 0, true, true, { 'a', 'b', 'c' })
+      eq({ 'a', 'b', 'c' }, curbuf_depr('get_line_slice', 0, 2, true, true)) --sanity
+
+      eq({}, curbuf_depr('get_line_slice', 2, 3, false, true))
+      eq({}, curbuf_depr('get_line_slice', 3, 9, true, true))
+      eq({}, curbuf_depr('get_line_slice', 3, -1, true, true))
+      eq({}, curbuf_depr('get_line_slice', -3, -4, false, true))
+      eq({}, curbuf_depr('get_line_slice', -4, -5, true, true))
+    end)
+
+    it('set_line_slice: out-of-bounds extends past end', function()
+      curbuf_depr('set_line_slice', 0, 0, true, true, { 'a', 'b', 'c' })
+      eq({ 'a', 'b', 'c' }, curbuf_depr('get_line_slice', 0, 2, true, true)) --sanity
+
+      eq({ 'c' }, curbuf_depr('get_line_slice', -1, 4, true, true))
+      eq({ 'a', 'b', 'c' }, curbuf_depr('get_line_slice', 0, 5, true, true))
+      curbuf_depr('set_line_slice', 4, 5, true, true, { 'd' })
+      eq({ 'a', 'b', 'c', 'd' }, curbuf_depr('get_line_slice', 0, 5, true, true))
+      curbuf_depr('set_line_slice', -4, -5, true, true, { 'e' })
+      eq({ 'e', 'a', 'b', 'c', 'd' }, curbuf_depr('get_line_slice', 0, 5, true, true))
+    end)
+
+    it('works', function()
+      eq({ '' }, curbuf_depr('get_line_slice', 0, -1, true, true))
+      -- Replace buffer
+      curbuf_depr('set_line_slice', 0, -1, true, true, { 'a', 'b', 'c' })
+      eq({ 'a', 'b', 'c' }, curbuf_depr('get_line_slice', 0, -1, true, true))
+      eq({ 'b', 'c' }, curbuf_depr('get_line_slice', 1, -1, true, true))
+      eq({ 'b' }, curbuf_depr('get_line_slice', 1, 2, true, false))
+      eq({}, curbuf_depr('get_line_slice', 1, 1, true, false))
+      eq({ 'a', 'b' }, curbuf_depr('get_line_slice', 0, -1, true, false))
+      eq({ 'b' }, curbuf_depr('get_line_slice', 1, -1, true, false))
+      eq({ 'b', 'c' }, curbuf_depr('get_line_slice', -2, -1, true, true))
+      curbuf_depr('set_line_slice', 1, 2, true, false, { 'a', 'b', 'c' })
+      eq({ 'a', 'a', 'b', 'c', 'c' }, curbuf_depr('get_line_slice', 0, -1, true, true))
+      curbuf_depr('set_line_slice', -1, -1, true, true, { 'a', 'b', 'c' })
+      eq({ 'a', 'a', 'b', 'c', 'a', 'b', 'c' }, curbuf_depr('get_line_slice', 0, -1, true, true))
+      curbuf_depr('set_line_slice', 0, -3, true, false, {})
+      eq({ 'a', 'b', 'c' }, curbuf_depr('get_line_slice', 0, -1, true, true))
+      curbuf_depr('set_line_slice', 0, -1, true, true, {})
+      eq({ '' }, curbuf_depr('get_line_slice', 0, -1, true, true))
+    end)
+  end)
+
+  describe_lua_and_rpc('nvim_buf_get_lines, nvim_buf_set_lines', function(lua_or_rpc)
+    local function get_lines(...)
+      return lua_or_rpc.nvim_buf_get_lines(0, ...)
+    end
+
+    local function set_lines(...)
+      return lua_or_rpc.nvim_buf_set_lines(0, ...)
+    end
+
+    local function line_count()
+      return lua_or_rpc.nvim_buf_line_count(0)
+    end
+
+    it('fails correctly when input is not valid', function()
+      eq(1, lua_or_rpc.nvim_buf_get_number(0))
+      eq(
+        [['replacement string' item contains newlines]],
+        pcall_err(lua_or_rpc.nvim_buf_set_lines, 1, 1, 2, false, { 'b\na' })
+      )
+    end)
+
+    it("fails if 'nomodifiable'", function()
+      command('set nomodifiable')
+      eq(
+        [[Buffer is not 'modifiable']],
+        pcall_err(lua_or_rpc.nvim_buf_set_lines, 1, 1, 2, false, { 'a', 'b' })
+      )
+    end)
+
+    it('has correct line_count when inserting and deleting', function()
+      eq(1, line_count())
+      set_lines(-1, -1, true, { 'line' })
+      eq(2, line_count())
+      set_lines(-1, -1, true, { 'line' })
+      eq(3, line_count())
+      set_lines(-2, -1, true, {})
+      eq(2, line_count())
+      set_lines(-2, -1, true, {})
+      set_lines(-2, -1, true, {})
+      -- There's always at least one line
+      eq(1, line_count())
+    end)
+
+    it('can get, set and delete a single line', function()
+      eq({ '' }, get_lines(0, 1, true))
+      set_lines(0, 1, true, { 'line1' })
+      eq({ 'line1' }, get_lines(0, 1, true))
+      set_lines(0, 1, true, { 'line2' })
+      eq({ 'line2' }, get_lines(0, 1, true))
+      set_lines(0, 1, true, {})
+      eq({ '' }, get_lines(0, 1, true))
+    end)
+
+    it('can get a single line with strict indexing', function()
+      set_lines(0, 1, true, { 'line1.a' })
+      eq(1, line_count()) -- sanity
+      eq('Index out of bounds', pcall_err(get_lines, 1, 2, true))
+      eq('Index out of bounds', pcall_err(get_lines, -3, -2, true))
+    end)
+
+    it('can get a single line with non-strict indexing', function()
+      set_lines(0, 1, true, { 'line1.a' })
+      eq(1, line_count()) -- sanity
+      eq({}, get_lines(1, 2, false))
+      eq({}, get_lines(-3, -2, false))
+    end)
+
+    it('can set and delete a single line with strict indexing', function()
+      set_lines(0, 1, true, { 'line1.a' })
+      eq('Index out of bounds', pcall_err(set_lines, 1, 2, true, { 'line1.b' }))
+      eq('Index out of bounds', pcall_err(set_lines, -3, -2, true, { 'line1.c' }))
+      eq({ 'line1.a' }, get_lines(0, -1, true))
+      eq('Index out of bounds', pcall_err(set_lines, 1, 2, true, {}))
+      eq('Index out of bounds', pcall_err(set_lines, -3, -2, true, {}))
+      eq({ 'line1.a' }, get_lines(0, -1, true))
+    end)
+
+    it('can set and delete a single line with non-strict indexing', function()
+      set_lines(0, 1, true, { 'line1.a' })
+      set_lines(1, 2, false, { 'line1.b' })
+      set_lines(-4, -3, false, { 'line1.c' })
+      eq({ 'line1.c', 'line1.a', 'line1.b' }, get_lines(0, -1, true))
+      set_lines(3, 4, false, {})
+      set_lines(-5, -4, false, {})
+      eq({ 'line1.c', 'line1.a', 'line1.b' }, get_lines(0, -1, true))
+    end)
+
+    it('can handle NULs', function()
+      set_lines(0, 1, true, { 'ab\0cd' })
+      eq({ 'ab\0cd' }, get_lines(0, -1, true))
+    end)
+
+    it('works with multiple lines', function()
+      eq({ '' }, get_lines(0, -1, true))
+      -- Replace buffer
+      for _, mode in pairs({ false, true }) do
+        set_lines(0, -1, mode, { 'a', 'b', 'c' })
+        eq({ 'a', 'b', 'c' }, get_lines(0, -1, mode))
+        eq({ 'b', 'c' }, get_lines(1, -1, mode))
+        eq({ 'b' }, get_lines(1, 2, mode))
+        eq({}, get_lines(1, 1, mode))
+        eq({ 'a', 'b' }, get_lines(0, -2, mode))
+        eq({ 'b' }, get_lines(1, -2, mode))
+        eq({ 'b', 'c' }, get_lines(-3, -1, mode))
+        set_lines(1, 2, mode, { 'a', 'b', 'c' })
+        eq({ 'a', 'a', 'b', 'c', 'c' }, get_lines(0, -1, mode))
+        set_lines(-2, -1, mode, { 'a', 'b', 'c' })
+        eq({ 'a', 'a', 'b', 'c', 'a', 'b', 'c' }, get_lines(0, -1, mode))
+        set_lines(0, -4, mode, {})
+        eq({ 'a', 'b', 'c' }, get_lines(0, -1, mode))
+        set_lines(0, -1, mode, {})
+        eq({ '' }, get_lines(0, -1, mode))
+      end
+    end)
+
+    it('can get line ranges with non-strict indexing', function()
+      set_lines(0, -1, true, { 'a', 'b', 'c' })
+      eq({ 'a', 'b', 'c' }, get_lines(0, -1, true)) --sanity
+
+      eq({}, get_lines(3, 4, false))
+      eq({}, get_lines(3, 10, false))
+      eq({}, get_lines(-5, -5, false))
+      eq({}, get_lines(3, -1, false))
+      eq({}, get_lines(-3, -4, false))
+    end)
+
+    it('can get line ranges with strict indexing', function()
+      set_lines(0, -1, true, { 'a', 'b', 'c' })
+      eq({ 'a', 'b', 'c' }, get_lines(0, -1, true)) --sanity
+
+      eq('Index out of bounds', pcall_err(get_lines, 3, 4, true))
+      eq('Index out of bounds', pcall_err(get_lines, 3, 10, true))
+      eq('Index out of bounds', pcall_err(get_lines, -5, -5, true))
+      -- empty or inverted ranges are not errors
+      eq({}, get_lines(3, -1, true))
+      eq({}, get_lines(-3, -4, true))
+    end)
+
+    it('set_lines: out-of-bounds can extend past end', function()
+      set_lines(0, -1, true, { 'a', 'b', 'c' })
+      eq({ 'a', 'b', 'c' }, get_lines(0, -1, true)) --sanity
+
+      eq({ 'c' }, get_lines(-2, 5, false))
+      eq({ 'a', 'b', 'c' }, get_lines(0, 6, false))
+      eq('Index out of bounds', pcall_err(set_lines, 4, 6, true, { 'd' }))
+      set_lines(4, 6, false, { 'd' })
+      eq({ 'a', 'b', 'c', 'd' }, get_lines(0, -1, true))
+      eq('Index out of bounds', pcall_err(set_lines, -6, -6, true, { 'e' }))
+      set_lines(-6, -6, false, { 'e' })
+      eq({ 'e', 'a', 'b', 'c', 'd' }, get_lines(0, -1, true))
+    end)
+
+    it('set_lines on alternate buffer does not access invalid line (E315)', function()
+      command('set hidden')
+      insert('Initial file')
+      command('enew')
+      insert([[
+      More
+      Lines
+      Than
+      In
+      The
+      Other
+      Buffer]])
+      command('$')
+      eq(true, pcall(api.nvim_buf_set_lines, 0, 0, 1, false, { 'test' }))
+    end)
+
+    it("set_lines of invisible buffer doesn't move cursor in current window", function()
+      local screen = Screen.new(20, 5)
+
+      insert([[
+        Who would win?
+        A real window
+        with proper text]])
+      local buf = lua_or_rpc.nvim_create_buf(false, true)
+      screen:expect([[
+        Who would win?      |
+        A real window       |
+        with proper tex^t    |
+        {1:~                   }|
+                            |
+      ]])
+
+      lua_or_rpc.nvim_buf_set_lines(buf, 0, -1, true, { 'or some', 'scratchy text' })
+      feed('i') -- provoke redraw
+      screen:expect([[
+        Who would win?      |
+        A real window       |
+        with proper tex^t    |
+        {1:~                   }|
+        {5:-- INSERT --}        |
+      ]])
+    end)
+
+    it('set_lines on hidden buffer preserves "previous window" #9741', function()
+      insert([[
+        visible buffer line 1
+        line 2
+      ]])
+      local hiddenbuf = lua_or_rpc.nvim_create_buf(false, true)
+      command('vsplit')
+      command('vsplit')
+      feed('<c-w>l<c-w>l<c-w>l')
+      eq(3, fn.winnr())
+      feed('<c-w>h')
+      eq(2, fn.winnr())
+      lua_or_rpc.nvim_buf_set_lines(hiddenbuf, 0, -1, true, { 'hidden buffer line 1', 'line 2' })
+      feed('<c-w>p')
+      eq(3, fn.winnr())
+    end)
+
+    it('set_lines on unloaded buffer #8659 #22670', function()
+      local bufnr = api.nvim_get_current_buf()
+      lua_or_rpc.nvim_buf_set_lines(bufnr, 0, -1, false, { 'a', 'b', 'c' })
+      lua_or_rpc.nvim_buf_set_name(bufnr, 'set_lines')
+      finally(function()
+        os.remove('set_lines')
+      end)
+      command('write!')
+      command('new')
+      command('bunload! ' .. bufnr)
+      local new_bufnr = fn.bufnr('set_lines', true)
+      lua_or_rpc.nvim_buf_set_lines(new_bufnr, 0, -1, false, {})
+      eq({ '' }, lua_or_rpc.nvim_buf_get_lines(new_bufnr, 0, -1, false))
+      eq(true, api.nvim_buf_is_loaded(new_bufnr))
+    end)
+  end)
+
+  describe('nvim_buf_set_text', function()
+    local function get_lines(...)
+      return api.nvim_buf_get_lines(0, ...)
+    end
+
+    local function set_text(...)
+      return api.nvim_buf_set_text(0, ...)
+    end
+
+    it('works', function()
+      insert([[
+      hello foo!
+      text
+      ]])
+
+      eq({ 'hello foo!' }, get_lines(0, 1, true))
+
+      -- can replace a single word
+      set_text(0, 6, 0, 9, { 'world' })
+      eq({ 'hello world!', 'text' }, get_lines(0, 2, true))
+
+      -- can insert text
+      set_text(0, 0, 0, 0, { 'well ' })
+      eq({ 'well hello world!', 'text' }, get_lines(0, 2, true))
+
+      -- can delete text
+      set_text(0, 0, 0, 5, { '' })
+      eq({ 'hello world!', 'text' }, get_lines(0, 2, true))
+
+      -- can replace with multiple lines
+      set_text(0, 6, 0, 11, { 'foo', 'wo', 'more' })
+      eq({ 'hello foo', 'wo', 'more!', 'text' }, get_lines(0, 4, true))
+
+      -- will join multiple lines if needed
+      set_text(0, 6, 3, 4, { 'bar' })
+      eq({ 'hello bar' }, get_lines(0, 1, true))
+
+      -- can use negative line numbers
+      set_text(-2, 0, -2, 5, { 'goodbye' })
+      eq({ 'goodbye bar', '' }, get_lines(0, -1, true))
+
+      set_text(-1, 0, -1, 0, { 'text' })
+      eq({ 'goodbye bar', 'text' }, get_lines(0, 2, true))
+
+      -- can append to a line
+      set_text(1, 4, -1, 4, { ' and', 'more' })
+      eq({ 'goodbye bar', 'text and', 'more' }, get_lines(0, 3, true))
+
+      -- can use negative column numbers
+      set_text(0, -5, 0, -1, { '!' })
+      eq({ 'goodbye!' }, get_lines(0, 1, true))
+    end)
+
+    it('works with undo', function()
+      insert([[
+        hello world!
+        foo bar
+        ]])
+
+      -- setting text
+      set_text(0, 0, 0, 0, { 'well ' })
+      feed('u')
+      eq({ 'hello world!' }, get_lines(0, 1, true))
+
+      -- deleting text
+      set_text(0, 0, 0, 6, { '' })
+      feed('u')
+      eq({ 'hello world!' }, get_lines(0, 1, true))
+
+      -- inserting newlines
+      set_text(0, 0, 0, 0, { 'hello', 'mr ' })
+      feed('u')
+      eq({ 'hello world!' }, get_lines(0, 1, true))
+
+      -- deleting newlines
+      set_text(0, 0, 1, 4, { 'hello' })
+      feed('u')
+      eq({ 'hello world!' }, get_lines(0, 1, true))
+    end)
+
+    it('updates the cursor position', function()
+      insert([[
+      hello world!
+      ]])
+
+      -- position the cursor on `!`
+      api.nvim_win_set_cursor(0, { 1, 11 })
+      -- replace 'world' with 'foo'
+      set_text(0, 6, 0, 11, { 'foo' })
+      eq('hello foo!', curbuf_depr('get_line', 0))
+      -- cursor should be moved left by two columns (replacement is shorter by 2 chars)
+      eq({ 1, 9 }, api.nvim_win_get_cursor(0))
+
+      -- changelist entry reflects the edit column #28618
+      local changes = fn.getchangelist()[1]
+      eq(6, changes[#changes].col)
+    end)
+
+    it('updates the cursor position in non-current window', function()
+      insert([[
+      hello world!]])
+
+      -- position the cursor on `!`
+      api.nvim_win_set_cursor(0, { 1, 11 })
+
+      local win = api.nvim_get_current_win()
+      local buf = api.nvim_get_current_buf()
+
+      command('new')
+
+      -- replace 'world' with 'foo'
+      api.nvim_buf_set_text(buf, 0, 6, 0, 11, { 'foo' })
+      eq({ 'hello foo!' }, api.nvim_buf_get_lines(buf, 0, -1, true))
+      -- cursor should be moved left by two columns (replacement is shorter by 2 chars)
+      eq({ 1, 9 }, api.nvim_win_get_cursor(win))
+    end)
+
+    it('updates the cursor position in TWO non-current windows', function()
+      insert([[
+      hello world!]])
+
+      -- position the cursor on `!`
+      api.nvim_win_set_cursor(0, { 1, 11 })
+      local win = api.nvim_get_current_win()
+      local buf = api.nvim_get_current_buf()
+
+      command('split')
+      local win2 = api.nvim_get_current_win()
+      -- position the cursor on `w`
+      api.nvim_win_set_cursor(0, { 1, 6 })
+
+      command('new')
+
+      -- replace 'hello' with 'foo'
+      api.nvim_buf_set_text(buf, 0, 0, 0, 5, { 'foo' })
+      eq({ 'foo world!' }, api.nvim_buf_get_lines(buf, 0, -1, true))
+
+      -- both cursors should be moved left by two columns (replacement is shorter by 2 chars)
+      eq({ 1, 9 }, api.nvim_win_get_cursor(win))
+      eq({ 1, 4 }, api.nvim_win_get_cursor(win2))
+    end)
+
+    it('keep visual select position #29558', function()
+      insert([[1234]])
+      api.nvim_win_set_cursor(0, { 1, 1 })
+      feed('vl')
+      exec_lua([[
+        vim.defer_fn(function() vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { '0' }) end, 50)
+        vim.wait(80)
+      ]])
+      local mode = api.nvim_get_mode().mode
+      eq({ '23' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq({ 'v', { '01234' } }, { mode, api.nvim_buf_get_lines(0, 0, -1, false) })
+      feed('<ESC>')
+
+      api.nvim_buf_set_lines(0, 0, -1, false, { '1', '2', '3' })
+      api.nvim_win_set_cursor(0, { 2, 0 })
+      feed('v')
+      exec_lua([[
+        vim.defer_fn(function() vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { '0', '' }) end, 50)
+        vim.wait(80)
+      ]])
+      mode = api.nvim_get_mode().mode
+      eq({ '2' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq({ 'v', { '0', '1', '2', '3' } }, { mode, api.nvim_buf_get_lines(0, 0, -1, false) })
+      feed('<ESC>')
+
+      api.nvim_buf_set_lines(0, 0, -1, false, { '1', '2' })
+      api.nvim_win_set_cursor(0, { 1, 0 })
+      feed('vj')
+      exec_lua([[
+        vim.defer_fn(function() vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { '0' }) end, 50)
+        vim.wait(80)
+      ]])
+      mode = api.nvim_get_mode().mode
+      eq({ '1', '2' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq({ 'v', { '01', '2' } }, { mode, api.nvim_buf_get_lines(0, 0, -1, false) })
+      feed('<ESC>')
+
+      api.nvim_buf_set_lines(0, 0, -1, false, { '123' })
+      api.nvim_win_set_cursor(0, { 1, 1 })
+      feed('v')
+      exec_lua([[
+        vim.defer_fn(function() vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { '', '' }) end, 50)
+        vim.wait(80)
+      ]])
+      mode = api.nvim_get_mode().mode
+      eq({ '2' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq({ 'v', { '', '123' } }, { mode, api.nvim_buf_get_lines(0, 0, -1, false) })
+      feed('<ESC>')
+
+      -- Visual block mode
+      api.nvim_buf_set_lines(0, 0, -1, false, { '123', '456' })
+      api.nvim_win_set_cursor(0, { 1, 0 })
+      feed('<C-v>jl')
+      exec_lua([[
+        vim.defer_fn(function() vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { '0' }) end, 50)
+        vim.wait(80)
+      ]])
+      mode = api.nvim_get_mode().mode
+      eq({ '01', '45' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq(
+        { string.char(0x16), { '0123', '456' } },
+        { mode, api.nvim_buf_get_lines(0, 0, -1, false) }
+      )
+      feed('<ESC>')
+      -- also test nvim_buf_set_lines inserts line above visual selection
+      api.nvim_buf_set_lines(0, 0, -1, false, { '1', '2', '3' })
+      api.nvim_win_set_cursor(0, { 2, 0 })
+      feed('v')
+      exec_lua([[
+        vim.defer_fn(function() vim.api.nvim_buf_set_lines(0, 0, 0, false, { 'new' }) end, 50)
+        vim.wait(80)
+      ]])
+      mode = api.nvim_get_mode().mode
+      eq({ '2' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq({ 'v', { 'new', '1', '2', '3' } }, { mode, api.nvim_buf_get_lines(0, 0, -1, false) })
+      feed('<ESC>')
+
+      api.nvim_buf_set_lines(0, 0, -1, false, { '1234' })
+      api.nvim_win_set_cursor(0, { 1, 1 })
+      feed('vl')
+      exec_lua([[
+        vim.defer_fn(function()
+          vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { '0', 'foo' })
+        end, 50)
+        vim.wait(80)
+      ]])
+      mode = api.nvim_get_mode().mode
+      eq({ '23' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq({ 'v', { '0', 'foo1234' } }, { mode, api.nvim_buf_get_lines(0, 0, -1, false) })
+      feed('<ESC>')
+
+      api.nvim_buf_set_lines(0, 0, -1, false, { '1', '2', '3', '4', '5', '6', '7', '8', '9', '10' })
+      api.nvim_win_set_cursor(0, { 8, 0 })
+      feed('v')
+      exec_lua([[
+        vim.defer_fn(function() vim.api.nvim_buf_set_lines(0, 0, 5, false, {}) end, 50)
+        vim.wait(80)
+      ]])
+      mode = api.nvim_get_mode().mode
+      eq({ '8' }, fn.getregion(fn.getpos('.'), fn.getpos('v'), { type = mode }))
+      eq({ 'v', { '6', '7', '8', '9', '10' } }, { mode, api.nvim_buf_get_lines(0, 0, -1, false) })
+      feed('<ESC>')
+    end)
+
+    describe('when text is being added right at cursor position #22526', function()
+      it('updates the cursor position in NORMAL mode', function()
+        insert([[
+        abcd]])
+
+        -- position the cursor on 'c'
+        api.nvim_win_set_cursor(0, { 1, 2 })
+        -- add 'xxx' before 'c'
+        set_text(0, 2, 0, 2, { 'xxx' })
+        eq({ 'abxxxcd' }, get_lines(0, -1, true))
+        -- cursor should be on 'c'
+        eq({ 1, 5 }, api.nvim_win_get_cursor(0))
+      end)
+
+      it('updates the cursor position only in non-current window when in INSERT mode', function()
+        insert([[
+        abcd]])
+
+        -- position the cursor on 'c'
+        api.nvim_win_set_cursor(0, { 1, 2 })
+        -- open vertical split
+        feed('<c-w>v')
+        -- get into INSERT mode to treat cursor
+        -- as being after 'b', not on 'c'
+        feed('i')
+        -- add 'xxx' between 'b' and 'c'
+        set_text(0, 2, 0, 2, { 'xxx' })
+        eq({ 'abxxxcd' }, get_lines(0, -1, true))
+        -- in the current window cursor should stay after 'b'
+        eq({ 1, 2 }, api.nvim_win_get_cursor(0))
+        -- quit INSERT mode
+        feed('<esc>')
+        -- close current window
+        feed('<c-w>c')
+        -- in another window cursor should be on 'c'
+        eq({ 1, 5 }, api.nvim_win_get_cursor(0))
+      end)
+    end)
+
+    describe('when text is being deleted right at cursor position', function()
+      it('leaves cursor at the same position in NORMAL mode', function()
+        insert([[
+        abcd]])
+
+        -- position the cursor on 'b'
+        api.nvim_win_set_cursor(0, { 1, 1 })
+        -- delete 'b'
+        set_text(0, 1, 0, 2, {})
+        eq({ 'acd' }, get_lines(0, -1, true))
+        -- cursor is now on 'c'
+        eq({ 1, 1 }, api.nvim_win_get_cursor(0))
+      end)
+
+      it('maintains INSERT-mode cursor position current/non-current window', function()
+        insert([[
+        abcd]])
+
+        -- position the cursor on 'b'
+        api.nvim_win_set_cursor(0, { 1, 1 })
+        -- open vertical split
+        feed('<c-w>v')
+        -- get into INSERT mode to treat cursor
+        -- as being after 'a', not on 'b'
+        feed('i')
+        -- delete 'b'
+        set_text(0, 1, 0, 2, {})
+        eq({ 'acd' }, get_lines(0, -1, true))
+        -- cursor in the current window should stay after 'a'
+        eq({ 1, 1 }, api.nvim_win_get_cursor(0))
+        -- quit INSERT mode
+        feed('<esc>')
+        -- close current window
+        feed('<c-w>c')
+        -- cursor in non-current window should stay on 'c'
+        eq({ 1, 1 }, api.nvim_win_get_cursor(0))
+      end)
+    end)
+
+    describe('when cursor is inside replaced row range', function()
+      it('maintains cursor position if at start_row, but before start_col', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on ' ' before 'first'
+        api.nvim_win_set_cursor(0, { 1, 14 })
+
+        set_text(0, 15, 2, 11, {
+          'the line we do not want',
+          'but hopefully',
+        })
+
+        eq({
+          'This should be the line we do not want',
+          'but hopefully the last one',
+        }, get_lines(0, -1, true))
+        -- cursor should stay at the same position
+        eq({ 1, 14 }, api.nvim_win_get_cursor(0))
+      end)
+
+      it('maintains cursor position if at start_row and column is still valid', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 'f' in 'first'
+        api.nvim_win_set_cursor(0, { 1, 15 })
+
+        set_text(0, 15, 2, 11, {
+          'the line we do not want',
+          'but hopefully',
+        })
+
+        eq({
+          'This should be the line we do not want',
+          'but hopefully the last one',
+        }, get_lines(0, -1, true))
+        -- cursor should stay at the same position
+        eq({ 1, 15 }, api.nvim_win_get_cursor(0))
+      end)
+
+      it('adjusts cursor column to keep it valid if start_row got smaller', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 't' in 'first'
+        api.nvim_win_set_cursor(0, { 1, 19 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 15, 2, 24, {'last'})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ 'This should be last' }, get_lines(0, -1, true))
+        -- cursor should end up on 't' in 'last'
+        eq({ 1, 18 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 18 }, cursor)
+      end)
+
+      it('adjusts cursor column to keep it valid if start_row decreased in INSERT mode', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 't' in 'first'
+        api.nvim_win_set_cursor(0, { 1, 19 })
+        -- enter INSERT mode to treat cursor as being after 't'
+        feed('a')
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 15, 2, 24, {'last'})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ 'This should be last' }, get_lines(0, -1, true))
+        -- cursor should end up after 't' in 'last'
+        eq({ 1, 19 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 19 }, cursor)
+      end)
+
+      it('adjusts cursor to valid column in row after start_row if it got smaller', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 'w' in 'want'
+        api.nvim_win_set_cursor(0, { 2, 31 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 15, 2, 11, {
+            '1',
+            'then 2',
+            'and then',
+          })
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({
+          'This should be 1',
+          'then 2',
+          'and then the last one',
+        }, get_lines(0, -1, true))
+        -- cursor column should end up at the end of a row
+        eq({ 2, 5 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 2, 5 }, cursor)
+      end)
+
+      it(
+        'adjusts cursor to valid column in row after start_row if it got smaller in INSERT mode',
+        function()
+          insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+          -- position the cursor on 'w' in 'want'
+          api.nvim_win_set_cursor(0, { 2, 31 })
+          -- enter INSERT mode
+          feed('a')
+
+          local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 15, 2, 11, {
+            '1',
+            'then 2',
+            'and then',
+          })
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+          eq({
+            'This should be 1',
+            'then 2',
+            'and then the last one',
+          }, get_lines(0, -1, true))
+          -- cursor column should end up at the end of a row
+          eq({ 2, 6 }, api.nvim_win_get_cursor(0))
+          -- immediate call to nvim_win_get_cursor should have returned the same position
+          eq({ 2, 6 }, cursor)
+        end
+      )
+
+      it('adjusts cursor line and column to keep it inside replacement range', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 'n' in 'finally'
+        api.nvim_win_set_cursor(0, { 3, 6 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 15, 2, 11, {
+            'the line we do not want',
+            'but hopefully',
+          })
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({
+          'This should be the line we do not want',
+          'but hopefully the last one',
+        }, get_lines(0, -1, true))
+        -- cursor should end up on 'y' in 'hopefully'
+        -- to stay in the range, because it got smaller
+        eq({ 2, 12 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 2, 12 }, cursor)
+      end)
+
+      it('adjusts cursor line and column if replacement is empty', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 'r' in 'there'
+        api.nvim_win_set_cursor(0, { 2, 8 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 15, 2, 12, {})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ 'This should be the last one' }, get_lines(0, -1, true))
+        -- cursor should end up on the next column after deleted range
+        eq({ 1, 15 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 15 }, cursor)
+      end)
+
+      it('adjusts cursor line and column if replacement is empty and start_col == 0', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 'r' in 'there'
+        api.nvim_win_set_cursor(0, { 2, 8 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 0, 2, 4, {})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ 'finally the last one' }, get_lines(0, -1, true))
+        -- cursor should end up in column 0
+        eq({ 1, 0 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 0 }, cursor)
+      end)
+
+      it('adjusts cursor column if replacement ends at cursor row, after cursor column', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 'y' in 'finally'
+        api.nvim_win_set_cursor(0, { 3, 10 })
+        set_text(0, 15, 2, 11, { '1', 'this 2', 'and then' })
+
+        eq({
+          'This should be 1',
+          'this 2',
+          'and then the last one',
+        }, get_lines(0, -1, true))
+        -- cursor should end up on 'n' in 'then'
+        eq({ 3, 7 }, api.nvim_win_get_cursor(0))
+      end)
+
+      it(
+        'adjusts cursor column if replacement ends at cursor row, at cursor column in INSERT mode',
+        function()
+          insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+          -- position the cursor on 'y' at 'finally'
+          api.nvim_win_set_cursor(0, { 3, 10 })
+          -- enter INSERT mode to treat cursor as being between 'l' and 'y'
+          feed('i')
+          set_text(0, 15, 2, 11, { '1', 'this 2', 'and then' })
+
+          eq({
+            'This should be 1',
+            'this 2',
+            'and then the last one',
+          }, get_lines(0, -1, true))
+          -- cursor should end up after 'n' in 'then'
+          eq({ 3, 8 }, api.nvim_win_get_cursor(0))
+        end
+      )
+
+      it('adjusts cursor column if replacement is inside of a single line', function()
+        insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+        -- position the cursor on 'y' in 'finally'
+        api.nvim_win_set_cursor(0, { 3, 10 })
+        set_text(2, 4, 2, 11, { 'then' })
+
+        eq({
+          'This should be first',
+          'then there is a line we do not want',
+          'and then the last one',
+        }, get_lines(0, -1, true))
+        -- cursor should end up on 'n' in 'then'
+        eq({ 3, 7 }, api.nvim_win_get_cursor(0))
+      end)
+
+      it('does not move cursor column after end of a line', function()
+        insert([[
+        This should be the only line here
+        !!!]])
+
+        -- position cursor on the last '1'
+        api.nvim_win_set_cursor(0, { 2, 2 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 33, 1, 3, {})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ 'This should be the only line here' }, get_lines(0, -1, true))
+        -- cursor should end up on '!'
+        eq({ 1, 32 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 32 }, cursor)
+      end)
+
+      it('does not move cursor column before start of a line', function()
+        insert('\n!!!')
+
+        -- position cursor on the last '1'
+        api.nvim_win_set_cursor(0, { 2, 2 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 0, 1, 3, {})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ '' }, get_lines(0, -1, true))
+        -- cursor should end up on '!'
+        eq({ 1, 0 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 0 }, cursor)
+      end)
+
+      describe('with virtualedit', function()
+        it('adjusts cursor line/col to keep inside replacement range if not after eol', function()
+          insert([[
+          This should be first
+          then there is a line we do not want
+          and finally the last one]])
+
+          -- position cursor on 't' in 'want'
+          api.nvim_win_set_cursor(0, { 2, 34 })
+          -- turn on virtualedit
+          command('set virtualedit=all')
+
+          local cursor = exec_lua([[
+            vim.api.nvim_buf_set_text(0, 0, 15, 2, 11, {
+              'the line we do not want',
+              'but hopefully',
+            })
+            return vim.api.nvim_win_get_cursor(0)
+          ]])
+
+          eq({
+            'This should be the line we do not want',
+            'but hopefully the last one',
+          }, get_lines(0, -1, true))
+          -- cursor should end up on 'y' in 'hopefully'
+          -- to stay in the range
+          eq({ 2, 12 }, api.nvim_win_get_cursor(0))
+          -- immediate call to nvim_win_get_cursor should have returned the same position
+          eq({ 2, 12 }, cursor)
+          -- coladd should be 0
+          eq(0, fn.winsaveview().coladd)
+        end)
+
+        it('does not change cursor screen column when cursor >EOL and row got shorter', function()
+          insert([[
+          This should be first
+          then there is a line we do not want
+          and finally the last one]])
+
+          -- position cursor on 't' in 'want'
+          api.nvim_win_set_cursor(0, { 2, 34 })
+          -- turn on virtualedit
+          command('set virtualedit=all')
+          -- move cursor after eol
+          fn.winrestview({ coladd = 5 })
+
+          local cursor = exec_lua([[
+            vim.api.nvim_buf_set_text(0, 0, 15, 2, 11, {
+              'the line we do not want',
+              'but hopefully',
+            })
+            return vim.api.nvim_win_get_cursor(0)
+          ]])
+
+          eq({
+            'This should be the line we do not want',
+            'but hopefully the last one',
+          }, get_lines(0, -1, true))
+          -- cursor should end up at eol of a new row
+          eq({ 2, 26 }, api.nvim_win_get_cursor(0))
+          -- immediate call to nvim_win_get_cursor should have returned the same position
+          eq({ 2, 26 }, cursor)
+          -- coladd should be increased so that cursor stays in the same screen column
+          eq(13, fn.winsaveview().coladd)
+        end)
+
+        it(
+          'does not change cursor screen column when cursor is after eol and row got longer',
+          function()
+            insert([[
+          This should be first
+          then there is a line we do not want
+          and finally the last one]])
+
+            -- position cursor on 't' in 'first'
+            api.nvim_win_set_cursor(0, { 1, 19 })
+            -- turn on virtualedit
+            command('set virtualedit=all')
+            -- move cursor after eol
+            fn.winrestview({ coladd = 21 })
+
+            local cursor = exec_lua([[
+            vim.api.nvim_buf_set_text(0, 0, 15, 2, 11, {
+              'the line we do not want',
+              'but hopefully',
+            })
+            return vim.api.nvim_win_get_cursor(0)
+          ]])
+
+            eq({
+              'This should be the line we do not want',
+              'but hopefully the last one',
+            }, get_lines(0, -1, true))
+            -- cursor should end up at eol of a new row
+            eq({ 1, 38 }, api.nvim_win_get_cursor(0))
+            -- immediate call to nvim_win_get_cursor should have returned the same position
+            eq({ 1, 38 }, cursor)
+            -- coladd should be increased so that cursor stays in the same screen column
+            eq(2, fn.winsaveview().coladd)
+          end
+        )
+
+        it(
+          'does not change cursor screen column when cursor is after eol and row extended past cursor column',
+          function()
+            insert([[
+          This should be first
+          then there is a line we do not want
+          and finally the last one]])
+
+            -- position cursor on 't' in 'first'
+            api.nvim_win_set_cursor(0, { 1, 19 })
+            -- turn on virtualedit
+            command('set virtualedit=all')
+            -- move cursor after eol just a bit
+            fn.winrestview({ coladd = 3 })
+
+            local cursor = exec_lua([[
+            vim.api.nvim_buf_set_text(0, 0, 15, 2, 11, {
+              'the line we do not want',
+              'but hopefully',
+            })
+            return vim.api.nvim_win_get_cursor(0)
+          ]])
+
+            eq({
+              'This should be the line we do not want',
+              'but hopefully the last one',
+            }, get_lines(0, -1, true))
+            -- cursor should stay at the same screen column
+            eq({ 1, 22 }, api.nvim_win_get_cursor(0))
+            -- immediate call to nvim_win_get_cursor should have returned the same position
+            eq({ 1, 22 }, cursor)
+            -- coladd should become 0
+            eq(0, fn.winsaveview().coladd)
+          end
+        )
+
+        it(
+          'does not change cursor screen column when cursor is after eol and row range decreased',
+          function()
+            insert([[
+          This should be first
+          then there is a line we do not want
+          and one more
+          and finally the last one]])
+
+            -- position cursor on 'e' in 'more'
+            api.nvim_win_set_cursor(0, { 3, 11 })
+            -- turn on virtualedit
+            command('set virtualedit=all')
+            -- move cursor after eol
+            fn.winrestview({ coladd = 28 })
+
+            local cursor = exec_lua([[
+            vim.api.nvim_buf_set_text(0, 0, 15, 3, 11, {
+              'the line we do not want',
+              'but hopefully',
+            })
+            return vim.api.nvim_win_get_cursor(0)
+          ]])
+
+            eq({
+              'This should be the line we do not want',
+              'but hopefully the last one',
+            }, get_lines(0, -1, true))
+            -- cursor should end up at eol of a new row
+            eq({ 2, 26 }, api.nvim_win_get_cursor(0))
+            -- immediate call to nvim_win_get_cursor should have returned the same position
+            eq({ 2, 26 }, cursor)
+            -- coladd should be increased so that cursor stays in the same screen column
+            eq(13, fn.winsaveview().coladd)
+          end
+        )
+      end)
+    end)
+
+    describe('when cursor is at end_row and after end_col', function()
+      it('adjusts cursor column when only a newline is added or deleted', function()
+        insert([[
+        first line
+        second
+         line]])
+
+        -- position the cursor on 'i'
+        api.nvim_win_set_cursor(0, { 3, 2 })
+        set_text(1, 6, 2, 0, {})
+        eq({ 'first line', 'second line' }, get_lines(0, -1, true))
+        -- cursor should stay on 'i'
+        eq({ 2, 8 }, api.nvim_win_get_cursor(0))
+
+        -- add a newline back
+        set_text(1, 6, 1, 6, { '', '' })
+        eq({ 'first line', 'second', ' line' }, get_lines(0, -1, true))
+        -- cursor should return back to the original position
+        eq({ 3, 2 }, api.nvim_win_get_cursor(0))
+      end)
+
+      it(
+        'adjusts cursor column if the range is not bound to either start or end of a line',
+        function()
+          insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+          -- position the cursor on 'h' in 'the'
+          api.nvim_win_set_cursor(0, { 3, 13 })
+          set_text(0, 14, 2, 11, {})
+          eq({ 'This should be the last one' }, get_lines(0, -1, true))
+          -- cursor should stay on 'h'
+          eq({ 1, 16 }, api.nvim_win_get_cursor(0))
+          -- add deleted lines back
+          set_text(0, 14, 0, 14, {
+            ' first',
+            'then there is a line we do not want',
+            'and finally',
+          })
+          eq({
+            'This should be first',
+            'then there is a line we do not want',
+            'and finally the last one',
+          }, get_lines(0, -1, true))
+          -- cursor should return back to the original position
+          eq({ 3, 13 }, api.nvim_win_get_cursor(0))
+        end
+      )
+
+      it(
+        'adjusts cursor column if replacing lines in range, not just deleting and adding',
+        function()
+          insert([[
+        This should be first
+        then there is a line we do not want
+        and finally the last one]])
+
+          -- position the cursor on 's' in 'last'
+          api.nvim_win_set_cursor(0, { 3, 18 })
+          set_text(0, 15, 2, 11, {
+            'the line we do not want',
+            'but hopefully',
+          })
+
+          eq({
+            'This should be the line we do not want',
+            'but hopefully the last one',
+          }, get_lines(0, -1, true))
+          -- cursor should stay on 's'
+          eq({ 2, 20 }, api.nvim_win_get_cursor(0))
+
+          set_text(0, 15, 1, 13, {
+            'first',
+            'then there is a line we do not want',
+            'and finally',
+          })
+
+          eq({
+            'This should be first',
+            'then there is a line we do not want',
+            'and finally the last one',
+          }, get_lines(0, -1, true))
+          -- cursor should return back to the original position
+          eq({ 3, 18 }, api.nvim_win_get_cursor(0))
+        end
+      )
+
+      it('does not move cursor column after end of a line', function()
+        insert([[
+        This should be the only line here
+        ]])
+
+        -- position cursor at the empty line
+        api.nvim_win_set_cursor(0, { 2, 0 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 33, 1, 0, {'!'})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ 'This should be the only line here!' }, get_lines(0, -1, true))
+        -- cursor should end up on '!'
+        eq({ 1, 33 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 33 }, cursor)
+      end)
+
+      it('does not move cursor column before start of a line', function()
+        insert('\n')
+
+        eq({ '', '' }, get_lines(0, -1, true))
+
+        -- position cursor on the last '1'
+        api.nvim_win_set_cursor(0, { 2, 2 })
+
+        local cursor = exec_lua([[
+          vim.api.nvim_buf_set_text(0, 0, 0, 1, 0, {''})
+          return vim.api.nvim_win_get_cursor(0)
+        ]])
+
+        eq({ '' }, get_lines(0, -1, true))
+        -- cursor should end up on '!'
+        eq({ 1, 0 }, api.nvim_win_get_cursor(0))
+        -- immediate call to nvim_win_get_cursor should have returned the same position
+        eq({ 1, 0 }, cursor)
+      end)
+    end)
+
+    it('can handle NULs', function()
+      set_text(0, 0, 0, 0, { 'ab\0cd' })
+      eq('ab\0cd', curbuf_depr('get_line', 0))
+    end)
+
+    it('adjusts extmarks', function()
+      local ns = api.nvim_create_namespace('my-fancy-plugin')
+      insert([[
+      foo bar
+      baz
+      ]])
+      local id1 = api.nvim_buf_set_extmark(0, ns, 0, 1, {})
+      local id2 = api.nvim_buf_set_extmark(0, ns, 0, 7, {})
+      local id3 = api.nvim_buf_set_extmark(0, ns, 1, 1, {})
+      set_text(0, 4, 0, 7, { 'q' })
+
+      eq({ 'foo q', 'baz' }, get_lines(0, 2, true))
+      -- mark before replacement point is unaffected
+      eq({ 0, 1 }, api.nvim_buf_get_extmark_by_id(0, ns, id1, {}))
+      -- mark gets shifted back because the replacement was shorter
+      eq({ 0, 5 }, api.nvim_buf_get_extmark_by_id(0, ns, id2, {}))
+      -- mark on the next line is unaffected
+      eq({ 1, 1 }, api.nvim_buf_get_extmark_by_id(0, ns, id3, {}))
+
+      -- replacing the text spanning two lines will adjust the mark on the next line
+      set_text(0, 3, 1, 3, { 'qux' })
+      eq({ 'fooqux', '' }, get_lines(0, 2, true))
+      eq({ 0, 6 }, api.nvim_buf_get_extmark_by_id(0, ns, id3, {}))
+      -- but mark before replacement point is still unaffected
+      eq({ 0, 1 }, api.nvim_buf_get_extmark_by_id(0, ns, id1, {}))
+      -- and the mark in the middle was shifted to the end of the insertion
+      eq({ 0, 6 }, api.nvim_buf_get_extmark_by_id(0, ns, id2, {}))
+
+      -- marks should be put back into the same place after undoing
+      set_text(0, 0, 0, 2, { '' })
+      feed('u')
+      eq({ 0, 1 }, api.nvim_buf_get_extmark_by_id(0, ns, id1, {}))
+      eq({ 0, 6 }, api.nvim_buf_get_extmark_by_id(0, ns, id2, {}))
+      eq({ 0, 6 }, api.nvim_buf_get_extmark_by_id(0, ns, id3, {}))
+
+      -- marks should be shifted over by the correct number of bytes for multibyte
+      -- chars
+      set_text(0, 0, 0, 0, { 'Ø' })
+      eq({ 0, 3 }, api.nvim_buf_get_extmark_by_id(0, ns, id1, {}))
+      eq({ 0, 8 }, api.nvim_buf_get_extmark_by_id(0, ns, id2, {}))
+      eq({ 0, 8 }, api.nvim_buf_get_extmark_by_id(0, ns, id3, {}))
+    end)
+
+    it('correctly marks changed region for redraw #13890', function()
+      local screen = Screen.new(20, 5)
+
+      insert([[
+      AAA
+      BBB
+      ]])
+
+      api.nvim_buf_set_text(0, 0, 0, 1, 3, { 'XXX', 'YYY' })
+
+      screen:expect([[
+        XXX                 |
+        YYY                 |
+        ^                    |
+        {1:~                   }|
+                            |
+      ]])
+    end)
+
+    it('errors on out-of-range', function()
+      insert([[
+      hello foo!
+      text]])
+      eq("Invalid 'start_row': out of range", pcall_err(set_text, 2, 0, 3, 0, {}))
+      eq("Invalid 'start_row': out of range", pcall_err(set_text, -3, 0, 0, 0, {}))
+      eq("Invalid 'end_row': out of range", pcall_err(set_text, 0, 0, 2, 0, {}))
+      eq("Invalid 'end_row': out of range", pcall_err(set_text, 0, 0, -3, 0, {}))
+      eq("Invalid 'start_col': out of range", pcall_err(set_text, 1, 5, 1, 5, {}))
+      eq("Invalid 'end_col': out of range", pcall_err(set_text, 1, 0, 1, 5, {}))
+    end)
+
+    it('errors when start is greater than end', function()
+      insert([[
+      hello foo!
+      text]])
+      eq("'start' is higher than 'end'", pcall_err(set_text, 1, 0, 0, 0, {}))
+      eq("'start' is higher than 'end'", pcall_err(set_text, 0, 1, 0, 0, {}))
+    end)
+
+    it('no heap-use-after-free when called consecutively #19643', function()
+      set_text(0, 0, 0, 0, { 'one', '', '', 'two' })
+      eq({ 'one', '', '', 'two' }, get_lines(0, 4, true))
+      api.nvim_win_set_cursor(0, { 1, 0 })
+      exec_lua([[
+        vim.api.nvim_buf_set_text(0, 0, 3, 1, 0, {''})
+        vim.api.nvim_buf_set_text(0, 0, 3, 1, 0, {''})
+      ]])
+      eq({ 'one', 'two' }, get_lines(0, 2, true))
+    end)
+
+    it('auto-loads unloaded buffer', function()
+      local new_bufnr = fn.bufnr('set_text', true)
+      eq(false, api.nvim_buf_is_loaded(new_bufnr))
+      api.nvim_buf_set_text(new_bufnr, 0, 0, 0, -1, { 'foo' })
+      eq(true, api.nvim_buf_is_loaded(new_bufnr))
+      eq({ 'foo' }, api.nvim_buf_get_lines(new_bufnr, 0, -1, false))
+    end)
+
+    describe('handles topline', function()
+      local screen
+      before_each(function()
+        screen = Screen.new(20, 12)
+        api.nvim_buf_set_lines(
+          0,
+          0,
+          -1,
+          true,
+          { 'aaa', 'bbb', 'ccc', 'ddd', 'www', 'xxx', 'yyy', 'zzz' }
+        )
+        api.nvim_set_option_value('modified', false, {})
+      end)
+
+      it('of current window', function()
+        local win = api.nvim_get_current_win()
+        local buf = api.nvim_get_current_buf()
+
+        command('new | wincmd w')
+        api.nvim_win_set_cursor(win, { 8, 0 })
+
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          ^zzz                 |
+          {3:[No Name]           }|
+                              |
+        ]],
+        }
+        api.nvim_buf_set_text(buf, 0, 3, 1, 0, { 'X' })
+
+        screen:expect {
+          grid = [[
+                              |
+          {1:~                   }|*4
+          {2:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          ^zzz                 |
+          {3:[No Name] [+]       }|
+                              |
+        ]],
+        }
+      end)
+
+      it('of non-current window', function()
+        local win = api.nvim_get_current_win()
+        local buf = api.nvim_get_current_buf()
+
+        command('new')
+        api.nvim_win_set_cursor(win, { 8, 0 })
+
+        screen:expect {
+          grid = [[
+          ^                    |
+          {1:~                   }|*4
+          {3:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name]           }|
+                              |
+        ]],
+        }
+
+        api.nvim_buf_set_text(buf, 0, 3, 1, 0, { 'X' })
+        screen:expect {
+          grid = [[
+          ^                    |
+          {1:~                   }|*4
+          {3:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+        }
+      end)
+
+      it('of split windows with same buffer', function()
+        local win = api.nvim_get_current_win()
+        local buf = api.nvim_get_current_buf()
+
+        command('split')
+        api.nvim_win_set_cursor(win, { 8, 0 })
+        api.nvim_win_set_cursor(0, { 1, 1 })
+
+        screen:expect {
+          grid = [[
+          a^aa                 |
+          bbb                 |
+          ccc                 |
+          ddd                 |
+          www                 |
+          {3:[No Name]           }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name]           }|
+                              |
+        ]],
+        }
+        api.nvim_buf_set_text(buf, 0, 3, 1, 0, { 'X' })
+
+        screen:expect {
+          grid = [[
+          a^aaXbbb             |
+          ccc                 |
+          ddd                 |
+          www                 |
+          xxx                 |
+          {3:[No Name] [+]       }|
+          www                 |
+          xxx                 |
+          yyy                 |
+          zzz                 |
+          {2:[No Name] [+]       }|
+                              |
+        ]],
+        }
+      end)
+
+      describe('of current window when', function()
+        before_each(function()
+          command('new | wincmd w | setlocal modified')
+          feed('Gk')
+          screen:expect([[
+                                |
+            {1:~                   }|*4
+            {2:[No Name]           }|
+            www                 |
+            xxx                 |
+            ^yyy                 |
+            zzz                 |
+            {3:[No Name] [+]       }|
+                                |
+          ]])
+        end)
+
+        it('deleting 3 lines around topline', function()
+          api.nvim_buf_set_text(0, 3, 0, 6, 0, {})
+          screen:expect([[
+                                |
+            {1:~                   }|*4
+            {2:[No Name]           }|
+            ccc                 |
+            ^yyy                 |
+            zzz                 |
+            {1:~                   }|
+            {3:[No Name] [+]       }|
+                                |
+          ]])
+          eq(5, api.nvim_buf_line_count(0))
+        end)
+
+        it('deleting 3 lines around the line just before topline', function()
+          api.nvim_buf_set_text(0, 2, 0, 5, 0, {})
+          screen:expect([[
+                                |
+            {1:~                   }|*4
+            {2:[No Name]           }|
+            bbb                 |
+            xxx                 |
+            ^yyy                 |
+            zzz                 |
+            {3:[No Name] [+]       }|
+                                |
+          ]])
+          eq(5, api.nvim_buf_line_count(0))
+        end)
+
+        for count = 1, 4 do
+          it(('deleting %d lines just before topline'):format(count), function()
+            api.nvim_buf_set_text(0, 4 - count, 0, 4, 0, {})
+            screen:expect_unchanged()
+            eq(8 - count, api.nvim_buf_line_count(0))
+          end)
+
+          describe(('replacing %d lines just before topline with 2 lines'):format(count), function()
+            it('including final newline', function()
+              api.nvim_buf_set_text(0, 4 - count, 0, 4, 0, { 'eee', 'fff', '' })
+              screen:expect_unchanged()
+              eq(8 - count + 2, api.nvim_buf_line_count(0))
+            end)
+
+            it('excluding final newline', function()
+              api.nvim_buf_set_text(0, 4 - count, 0, 3, -1, { 'eee', 'fff' })
+              screen:expect_unchanged()
+              eq(8 - count + 2, api.nvim_buf_line_count(0))
+            end)
+          end)
+        end
+
+        for count = 1, 3 do
+          it(('deleting %d lines far before topline'):format(count), function()
+            api.nvim_buf_set_text(0, 0, 0, count, 0, {})
+            screen:expect_unchanged()
+            eq(8 - count, api.nvim_buf_line_count(0))
+          end)
+
+          describe(('replacing %d lines far before topline with 2 lines'):format(count), function()
+            it('including final newline', function()
+              api.nvim_buf_set_text(0, 0, 0, count, 0, { 'eee', 'fff', '' })
+              screen:expect_unchanged()
+              eq(8 - count + 2, api.nvim_buf_line_count(0))
+            end)
+
+            it('excluding final newline', function()
+              api.nvim_buf_set_text(0, 0, 0, count - 1, -1, { 'eee', 'fff' })
+              screen:expect_unchanged()
+              eq(8 - count + 2, api.nvim_buf_line_count(0))
+            end)
+          end)
+        end
+
+        describe('replacing topline', function()
+          describe('with 1 line', function()
+            local s1 = [[
+                                  |
+              {1:~                   }|*4
+              {2:[No Name]           }|
+              eee                 |
+              xxx                 |
+              ^yyy                 |
+              zzz                 |
+              {3:[No Name] [+]       }|
+                                  |
+            ]]
+            it('including final newline', function()
+              api.nvim_buf_set_text(0, 4, 0, 5, 0, { 'eee', '' })
+              screen:expect(s1)
+            end)
+            it('excluding final newline', function()
+              api.nvim_buf_set_text(0, 4, 0, 4, -1, { 'eee' })
+              screen:expect(s1)
+            end)
+          end)
+
+          describe('with 2 lines', function()
+            local s2 = [[
+                                  |
+              {1:~                   }|*4
+              {2:[No Name]           }|
+              eee                 |
+              fff                 |
+              xxx                 |
+              ^yyy                 |
+              {3:[No Name] [+]       }|
+                                  |
+            ]]
+            it('including final newline', function()
+              api.nvim_buf_set_text(0, 4, 0, 5, 0, { 'eee', 'fff', '' })
+              screen:expect(s2)
+            end)
+            it('excluding final newline', function()
+              api.nvim_buf_set_text(0, 4, 0, 4, -1, { 'eee', 'fff' })
+              screen:expect(s2)
+            end)
+          end)
+        end)
+
+        it('inserting at start of topline', function()
+          api.nvim_buf_set_text(0, 4, 0, 4, 0, { 'X', '' })
+          screen:expect([[
+                                |
+            {1:~                   }|*4
+            {2:[No Name]           }|
+            X                   |
+            www                 |
+            xxx                 |
+            ^yyy                 |
+            {3:[No Name] [+]       }|
+                                |
+          ]])
+        end)
+      end)
+    end)
+  end)
+
+  describe_lua_and_rpc('nvim_buf_get_text', function(lua_or_rpc)
+    local get_text = lua_or_rpc.nvim_buf_get_text
+    before_each(function()
+      insert([[
+      hello foo!
+      text
+      more]])
+    end)
+
+    it('works', function()
+      eq({ 'hello' }, get_text(0, 0, 0, 0, 5, {}))
+      eq({ 'hello foo!' }, get_text(0, 0, 0, 0, 42, {}))
+      eq({ 'foo!' }, get_text(0, 0, 6, 0, 10, {}))
+      eq({ 'foo!', 'tex' }, get_text(0, 0, 6, 1, 3, {}))
+      eq({ 'foo!', 'tex' }, get_text(0, -3, 6, -2, 3, {}))
+      eq({ '' }, get_text(0, 0, 18, 0, 20, {}))
+      eq({ 'ext' }, get_text(0, -2, 1, -2, 4, {}))
+      eq({ 'hello foo!', 'text', 'm' }, get_text(0, 0, 0, 2, 1, {}))
+      eq({ 'hello foo!' }, get_text(0, 0, -987654321, 0, 987654321, {}))
+      eq({ '' }, get_text(0, 0, -15, 0, -20, {}))
+    end)
+
+    it('errors on out-of-range', function()
+      eq('Index out of bounds', pcall_err(get_text, 0, 2, 0, 4, 0, {}))
+      eq('Index out of bounds', pcall_err(get_text, 0, -4, 0, 0, 0, {}))
+      eq('Index out of bounds', pcall_err(get_text, 0, 0, 0, 3, 0, {}))
+      eq('Index out of bounds', pcall_err(get_text, 0, 0, 0, -4, 0, {}))
+      -- no ml_get errors should happen #19017
+      eq('', api.nvim_get_vvar('errmsg'))
+    end)
+
+    it('errors when start is greater than end', function()
+      eq("'start' is higher than 'end'", pcall_err(get_text, 0, 1, 0, 0, 0, {}))
+      eq('start_col must be less than or equal to end_col', pcall_err(get_text, 0, 0, 1, 0, 0, {}))
+    end)
+  end)
+
+  describe('nvim_buf_get_offset', function()
+    local get_offset = api.nvim_buf_get_offset
+    it('works', function()
+      api.nvim_buf_set_lines(0, 0, -1, true, { 'Some\r', 'exa\000mple', '', 'buf\rfer', 'text' })
+      eq(5, api.nvim_buf_line_count(0))
+      eq(0, get_offset(0, 0))
+      eq(6, get_offset(0, 1))
+      eq(15, get_offset(0, 2))
+      eq(16, get_offset(0, 3))
+      eq(24, get_offset(0, 4))
+      eq(29, get_offset(0, 5))
+      eq('Index out of bounds', pcall_err(get_offset, 0, 6))
+      eq('Index out of bounds', pcall_err(get_offset, 0, -1))
+
+      api.nvim_set_option_value('eol', false, {})
+      api.nvim_set_option_value('fixeol', false, {})
+      eq(28, get_offset(0, 5))
+
+      -- fileformat is ignored
+      api.nvim_set_option_value('fileformat', 'dos', {})
+      eq(0, get_offset(0, 0))
+      eq(6, get_offset(0, 1))
+      eq(15, get_offset(0, 2))
+      eq(16, get_offset(0, 3))
+      eq(24, get_offset(0, 4))
+      eq(28, get_offset(0, 5))
+      api.nvim_set_option_value('eol', true, {})
+      eq(29, get_offset(0, 5))
+
+      command('set hidden')
+      command('enew')
+      eq(6, api.nvim_buf_get_offset(1, 1))
+      command('bunload! 1')
+      eq(-1, api.nvim_buf_get_offset(1, 1))
+      eq(-1, api.nvim_buf_get_offset(1, 0))
+    end)
+
+    it('works in empty buffer', function()
+      eq(0, get_offset(0, 0))
+      eq(1, get_offset(0, 1))
+      eq(-1, fn.line2byte('$'))
+    end)
+
+    it('works in buffer with one line inserted', function()
+      feed('itext')
+      eq(0, get_offset(0, 0))
+      eq(5, get_offset(0, 1))
+    end)
+  end)
+
+  describe('nvim_buf_get_var, nvim_buf_set_var, nvim_buf_del_var', function()
+    it('works', function()
+      api.nvim_buf_set_var(0, 'lua', { 1, 2, { ['3'] = 1 } })
+      eq({ 1, 2, { ['3'] = 1 } }, api.nvim_buf_get_var(0, 'lua'))
+      eq({ 1, 2, { ['3'] = 1 } }, api.nvim_eval('b:lua'))
+      eq(1, fn.exists('b:lua'))
+      api.nvim_buf_del_var(0, 'lua')
+      eq(0, fn.exists('b:lua'))
+      eq('Key not found: lua', pcall_err(api.nvim_buf_del_var, 0, 'lua'))
+      api.nvim_buf_set_var(0, 'lua', 1)
+      command('lockvar b:lua')
+      eq('Key is locked: lua', pcall_err(api.nvim_buf_del_var, 0, 'lua'))
+      eq('Key is locked: lua', pcall_err(api.nvim_buf_set_var, 0, 'lua', 1))
+      eq('Key is read-only: changedtick', pcall_err(api.nvim_buf_del_var, 0, 'changedtick'))
+      eq('Key is read-only: changedtick', pcall_err(api.nvim_buf_set_var, 0, 'changedtick', 1))
+    end)
+  end)
+
+  describe('nvim_buf_get_changedtick', function()
+    it('works', function()
+      eq(2, api.nvim_buf_get_changedtick(0))
+      api.nvim_buf_set_lines(0, 0, 1, false, { 'abc\0', '\0def', 'ghi' })
+      eq(3, api.nvim_buf_get_changedtick(0))
+      eq(3, api.nvim_buf_get_var(0, 'changedtick'))
+    end)
+
+    it('buffer_set_var returns the old value', function()
+      local val1 = { 1, 2, { ['3'] = 1 } }
+      local val2 = { 4, 7 }
+      eq(NIL, request('buffer_set_var', 0, 'lua', val1))
+      eq(val1, request('buffer_set_var', 0, 'lua', val2))
+    end)
+
+    it('buffer_del_var returns the old value', function()
+      local val1 = { 1, 2, { ['3'] = 1 } }
+      local val2 = { 4, 7 }
+      eq(NIL, request('buffer_set_var', 0, 'lua', val1))
+      eq(val1, request('buffer_set_var', 0, 'lua', val2))
+      eq(val2, request('buffer_del_var', 0, 'lua'))
+    end)
+  end)
+
+  describe('nvim_get_option_value, nvim_set_option_value', function()
+    it('works', function()
+      eq(8, api.nvim_get_option_value('shiftwidth', {}))
+      api.nvim_set_option_value('shiftwidth', 4, {})
+      eq(4, api.nvim_get_option_value('shiftwidth', {}))
+      -- global-local option
+      api.nvim_set_option_value('define', 'test', { buf = 0 })
+      eq('test', api.nvim_get_option_value('define', { buf = 0 }))
+      -- Doesn't change the global value
+      eq('', api.nvim_get_option_value('define', { scope = 'global' }))
+    end)
+
+    it('returns values for unset local options', function()
+      -- 'undolevels' is only set to its "unset" value when a new buffer is
+      -- created
+      command('enew')
+      eq(-123456, api.nvim_get_option_value('undolevels', { buf = 0 }))
+    end)
+  end)
+
+  describe('nvim_buf_get_name, nvim_buf_set_name', function()
+    it('works', function()
+      command('new')
+      eq('', api.nvim_buf_get_name(0))
+      local new_name = api.nvim_eval('resolve(tempname())')
+      api.nvim_buf_set_name(0, new_name)
+      eq(new_name, api.nvim_buf_get_name(0))
+      command('w!')
+      eq(1, fn.filereadable(new_name))
+      os.remove(new_name)
+    end)
+
+    it('directory buffer-name always ends with slash', function()
+      local cwd = t.fix_slashes(fn.getcwd())
+      local dir = 'Xtest_dir_name'
+      t.mkdir(dir)
+      finally(function()
+        n.rmdir(dir)
+      end)
+      api.nvim_buf_set_name(0, dir)
+      eq(cwd .. '/' .. dir .. '/', t.fix_slashes(api.nvim_buf_get_name(0)))
+    end)
+
+    it('directory buffer-name preserves symbolic link path', function()
+      t.skip(t.is_os('win'), 'N/A for Windows')
+      local cwd = t.fix_slashes(fn.getcwd())
+      local target = 'Xtest_dir_target'
+      local link = 'Xtest_dir_link'
+      t.mkdir(target)
+      assert(vim.uv.fs_symlink(assert(vim.uv.fs_realpath(target)), link, { dir = true }))
+      finally(function()
+        os.remove(link)
+        n.rmdir(target)
+      end)
+      api.nvim_buf_set_name(0, link .. '/')
+      eq(cwd .. '/' .. link .. '/', t.fix_slashes(api.nvim_buf_get_name(0)))
+    end)
+
+    it('allows URI buffer names that differ by a trailing slash', function()
+      api.nvim_buf_set_name(0, 'test://example')
+      local trailing_slash = api.nvim_create_buf(true, false)
+      api.nvim_buf_set_name(trailing_slash, 'test://example/')
+
+      eq('test://example', api.nvim_buf_get_name(0))
+      eq('test://example/', api.nvim_buf_get_name(trailing_slash))
+    end)
+
+    describe("with 'autochdir'", function()
+      local topdir
+      local oldbuf
+      local newbuf
+
+      before_each(function()
+        command('set shellslash')
+        topdir = fn.getcwd()
+        t.mkdir(topdir .. '/Xacd')
+
+        oldbuf = api.nvim_get_current_buf()
+        command('vnew')
+        newbuf = api.nvim_get_current_buf()
+        command('set autochdir')
+      end)
+
+      after_each(function()
+        n.rmdir(topdir .. '/Xacd')
+      end)
+
+      it('does not change cwd with non-current buffer', function()
+        api.nvim_buf_set_name(oldbuf, topdir .. '/Xacd/foo.txt')
+        eq(topdir, fn.getcwd())
+      end)
+
+      it('changes cwd with current buffer', function()
+        api.nvim_buf_set_name(newbuf, topdir .. '/Xacd/foo.txt')
+        eq(topdir .. '/Xacd', fn.getcwd())
+      end)
+    end)
+  end)
+
+  describe('nvim_buf_is_loaded', function()
+    it('works', function()
+      -- record our buffer number for when we unload it
+      local bufnr = api.nvim_get_current_buf()
+      -- api should report that the buffer is loaded
+      ok(api.nvim_buf_is_loaded(bufnr))
+      -- hide the current buffer by switching to a new empty buffer
+      -- Careful! we need to modify the buffer first or vim will just reuse it
+      api.nvim_buf_set_lines(bufnr, 0, -1, true, { 'line1' })
+      command('hide enew')
+      -- confirm the buffer is hidden, but still loaded
+      local infolist = api.nvim_eval('getbufinfo(' .. bufnr .. ')')
+      eq(1, #infolist)
+      eq(1, infolist[1].hidden)
+      eq(1, infolist[1].loaded)
+      -- now force unload the buffer
+      command('bunload! ' .. bufnr)
+      -- confirm the buffer is unloaded
+      infolist = api.nvim_eval('getbufinfo(' .. bufnr .. ')')
+      eq(0, infolist[1].loaded)
+      -- nvim_buf_is_loaded() should also report the buffer as unloaded
+      eq(false, api.nvim_buf_is_loaded(bufnr))
+    end)
+  end)
+
+  describe('nvim_buf_is_valid', function()
+    it('works', function()
+      command('new')
+      local b = api.nvim_get_current_buf()
+      ok(api.nvim_buf_is_valid(b))
+      command('bw!')
+      ok(not api.nvim_buf_is_valid(b))
+    end)
+  end)
+
+  describe('nvim_buf_delete', function()
+    it('allows for just deleting', function()
+      command('new')
+      local b = api.nvim_get_current_buf()
+      ok(api.nvim_buf_is_valid(b))
+      api.nvim_buf_delete(b, {})
+      ok(not api.nvim_buf_is_loaded(b))
+      ok(not api.nvim_buf_is_valid(b))
+    end)
+
+    it('allows for just unloading', function()
+      command('new')
+      local b = api.nvim_get_current_buf()
+      ok(api.nvim_buf_is_valid(b))
+      api.nvim_buf_delete(b, { unload = true })
+      ok(not api.nvim_buf_is_loaded(b))
+      ok(api.nvim_buf_is_valid(b))
+    end)
+
+    it('does not crash if WinClosed closes the next tabpage #40852', function()
+      exec_lua(function()
+        vim.cmd.tabnew()
+        vim.api.nvim_create_autocmd('WinClosed', {
+          callback = function()
+            pcall(vim.api.nvim_win_close, 0, true)
+          end,
+        })
+        local bufs = vim.api.nvim_list_bufs()
+        vim.api.nvim_buf_delete(bufs[#bufs - 1], { force = true })
+      end)
+      assert_alive()
+    end)
+  end)
+
+  describe('nvim_buf_get_mark', function()
+    it('works', function()
+      api.nvim_buf_set_lines(0, -1, -1, true, { 'a', 'bit of', 'text' })
+      api.nvim_win_set_cursor(0, { 3, 4 })
+      command('mark v')
+      eq({ 3, 0 }, api.nvim_buf_get_mark(0, 'v'))
+    end)
+  end)
+
+  describe('nvim_buf_set_mark', function()
+    it('works with buffer local marks', function()
+      api.nvim_buf_set_lines(0, -1, -1, true, { 'a', 'bit of', 'text' })
+      eq(true, api.nvim_buf_set_mark(0, 'z', 1, 1, {}))
+      eq({ 1, 1 }, api.nvim_buf_get_mark(0, 'z'))
+      eq({ 0, 1, 2, 0 }, fn.getpos("'z"))
+    end)
+    it('works with file/uppercase marks', function()
+      api.nvim_buf_set_lines(0, -1, -1, true, { 'a', 'bit of', 'text' })
+      eq(true, api.nvim_buf_set_mark(0, 'Z', 3, 2, {}))
+      eq({ 3, 2 }, api.nvim_buf_get_mark(0, 'Z'))
+      eq({ api.nvim_get_current_buf(), 3, 3, 0 }, fn.getpos("'Z"))
+    end)
+    it('fails when invalid marks names are used', function()
+      eq(false, pcall(api.nvim_buf_set_mark, 0, '!', 1, 0, {}))
+      eq(false, pcall(api.nvim_buf_set_mark, 0, 'fail', 1, 0, {}))
+    end)
+    it('fails when invalid buffer number is used', function()
+      eq(false, pcall(api.nvim_buf_set_mark, 99, 'a', 1, 1, {}))
+    end)
+    it('auto-loads unloaded buffer', function()
+      local new_bufnr = fn.bufnr('set_mark', true)
+      eq(false, api.nvim_buf_is_loaded(new_bufnr))
+      eq(true, api.nvim_buf_set_mark(new_bufnr, 'A', 0, 0, {}))
+      eq(true, api.nvim_buf_is_loaded(new_bufnr))
+      eq({ 0, 0 }, api.nvim_buf_get_mark(new_bufnr, 'A'))
+    end)
+  end)
+
+  describe('nvim_buf_del_mark', function()
+    it('works with buffer local marks', function()
+      api.nvim_buf_set_lines(0, -1, -1, true, { 'a', 'bit of', 'text' })
+      api.nvim_buf_set_mark(0, 'z', 3, 1, {})
+      eq(true, api.nvim_buf_del_mark(0, 'z'))
+      eq({ 0, 0 }, api.nvim_buf_get_mark(0, 'z'))
+    end)
+    it('works with file/uppercase marks', function()
+      api.nvim_buf_set_lines(0, -1, -1, true, { 'a', 'bit of', 'text' })
+      api.nvim_buf_set_mark(0, 'Z', 3, 3, {})
+      eq(true, api.nvim_buf_del_mark(0, 'Z'))
+      eq({ 0, 0 }, api.nvim_buf_get_mark(0, 'Z'))
+    end)
+    it('returns false in marks not set in this buffer', function()
+      local abuf = api.nvim_create_buf(false, true)
+      api.nvim_buf_set_lines(abuf, -1, -1, true, { 'a', 'bit of', 'text' })
+      api.nvim_buf_set_mark(abuf, 'A', 2, 2, {})
+      eq(false, api.nvim_buf_del_mark(0, 'A'))
+      eq({ 2, 2 }, api.nvim_buf_get_mark(abuf, 'A'))
+    end)
+    it('returns false if mark was not deleted', function()
+      api.nvim_buf_set_lines(0, -1, -1, true, { 'a', 'bit of', 'text' })
+      api.nvim_buf_set_mark(0, 'z', 3, 1, {})
+      eq(true, api.nvim_buf_del_mark(0, 'z'))
+      eq(false, api.nvim_buf_del_mark(0, 'z')) -- Mark was already deleted
+    end)
+    it('fails when invalid marks names are used', function()
+      eq(false, pcall(api.nvim_buf_del_mark, 0, '!'))
+      eq(false, pcall(api.nvim_buf_del_mark, 0, 'fail'))
+    end)
+    it('fails when invalid buffer number is used', function()
+      eq(false, pcall(api.nvim_buf_del_mark, 99, 'a'))
+    end)
+  end)
+
+  describe('nvim_buf_call', function()
+    it('window keeps the buffer when the callback closes the original window', function()
+      local origin = api.nvim_get_current_win()
+      local other_buf = api.nvim_create_buf(true, false)
+      local other_win = api.nvim_open_win(other_buf, false, { split = 'right' })
+      exec_lua(function()
+        vim.api.nvim_buf_call(other_buf, function()
+          vim.api.nvim_win_close(origin, true)
+          vim.cmd('enew') -- switch the context window away from other_buf
+        end)
+      end)
+      -- Original window is gone: stay in the nvim_buf_call window, but buffer is restored.
+      eq(other_win, api.nvim_get_current_win())
+      eq(other_buf, api.nvim_win_get_buf(other_win))
+    end)
+
+    it('preserves visual-mode, unless the callback ended it', function()
+      -- Same-buffer: Visual survives untouched.
+      command('normal! v')
+      exec_lua('vim.api.nvim_buf_call(0, function() end)')
+      eq('v', fn.mode())
+      -- The callback ends Visual mode: it must STAY ended.
+      exec_lua([[vim.api.nvim_buf_call(0, function() vim.cmd('normal! \27') end)]])
+      eq('n', fn.mode())
+    end)
+
+    it('supports multiple returns', function()
+      local curbuf = api.nvim_get_current_buf()
+      local other = api.nvim_create_buf(false, true)
+      exec_lua(function()
+        function with_len(...)
+          return select('#', ...), { ... }
+        end
+        function test(fn)
+          local len, res = with_len(vim.api.nvim_buf_call(other, fn))
+          -- convert to serializable vim.NIL
+          for i = 1, len do
+            if res[i] == nil then
+              res[i] = vim.NIL
+            end
+          end
+          return res
+        end
+      end)
+
+      eq(
+        { other },
+        exec_lua(function()
+          return test(function()
+            return vim.api.nvim_get_current_buf()
+          end)
+        end)
+      )
+      eq(curbuf, api.nvim_get_current_buf())
+      eq(
+        { other, vim.NIL },
+        exec_lua(function()
+          return test(function()
+            return vim.api.nvim_get_current_buf(), nil
+          end)
+        end)
+      )
+
+      eq(
+        { 6, 7 },
+        exec_lua(function()
+          return test(function()
+            return 6, 7
+          end)
+        end)
+      )
+      eq(
+        { 6, vim.NIL, 7 },
+        exec_lua(function()
+          return test(function()
+            return 6, nil, 7
+          end)
+        end)
+      )
+      eq(
+        {},
+        exec_lua(function()
+          return test(function() end)
+        end)
+      )
+      eq(
+        { vim.NIL },
+        exec_lua(function()
+          return test(function()
+            return nil
+          end)
+        end)
+      )
+    end)
+
+    it('propagates return values when called from a coroutine #39834', function()
+      local other = api.nvim_create_buf(false, true)
+      eq(
+        { other, vim.NIL, 42 },
+        exec_lua(function()
+          local out
+          local co = coroutine.create(function()
+            local function pack(...)
+              local r = { ... }
+              for i = 1, select('#', ...) do
+                if r[i] == nil then
+                  r[i] = vim.NIL
+                end
+              end
+              return r
+            end
+            out = pack(vim.api.nvim_buf_call(other, function()
+              return vim.api.nvim_get_current_buf(), nil, 42
+            end))
+          end)
+          assert(coroutine.resume(co))
+          return out
+        end)
+      )
+    end)
+
+    it('can access buf options', function()
+      local buf1 = api.nvim_get_current_buf()
+      local buf2 = exec_lua [[
+        buf2 = vim.api.nvim_create_buf(false, true)
+        return buf2
+      ]]
+
+      eq(false, api.nvim_get_option_value('autoindent', { buf = buf1 }))
+      eq(false, api.nvim_get_option_value('autoindent', { buf = buf2 }))
+
+      local val = exec_lua [[
+        return vim.api.nvim_buf_call(buf2, function()
+          vim.cmd "set autoindent"
+          return vim.api.nvim_get_current_buf()
+        end)
+      ]]
+
+      eq(false, api.nvim_get_option_value('autoindent', { buf = buf1 }))
+      eq(true, api.nvim_get_option_value('autoindent', { buf = buf2 }))
+      eq(buf1, api.nvim_get_current_buf())
+      eq(buf2, val)
+    end)
+
+    it('does not cause ml_get errors with invalid visual selection', function()
+      -- Should be fixed by vim-patch:8.2.4028.
+      exec_lua [[
+        local api = vim.api
+        local t = function(s) return api.nvim_replace_termcodes(s, true, true, true) end
+        api.nvim_buf_set_lines(0, 0, -1, true, {"a", "b", "c"})
+        api.nvim_feedkeys(t "G<C-V>", "txn", false)
+        api.nvim_buf_call(api.nvim_create_buf(false, true), function() vim.cmd "redraw" end)
+      ]]
+    end)
+
+    it('can be nested crazily with hidden buffers', function()
+      eq(
+        true,
+        exec_lua([[
+        local function scratch_buf_call(fn)
+          local buf = vim.api.nvim_create_buf(false, true)
+          vim.api.nvim_set_option_value('cindent', true, {buf = buf})
+          return vim.api.nvim_buf_call(buf, function()
+            return vim.api.nvim_get_current_buf() == buf
+              and vim.api.nvim_get_option_value('cindent', {buf = buf})
+              and fn()
+          end) and vim.api.nvim_buf_delete(buf, {}) == nil
+        end
+
+        return scratch_buf_call(function()
+          return scratch_buf_call(function()
+            return scratch_buf_call(function()
+              return scratch_buf_call(function()
+                return scratch_buf_call(function()
+                  return scratch_buf_call(function()
+                    return scratch_buf_call(function()
+                      return scratch_buf_call(function()
+                        return scratch_buf_call(function()
+                          return scratch_buf_call(function()
+                            return scratch_buf_call(function()
+                              return scratch_buf_call(function()
+                                return true
+                              end)
+                            end)
+                          end)
+                        end)
+                      end)
+                    end)
+                  end)
+                end)
+              end)
+            end)
+          end)
+        end)
+      ]])
+      )
+    end)
+
+    it('can return values by reference', function()
+      eq(
+        { 4, 7 },
+        exec_lua [[
+        local val = {4, 10}
+        local ref = vim.api.nvim_buf_call(0, function() return val end)
+        ref[2] = 7
+        return val
+      ]]
+      )
+    end)
+
+    it('can get Visual selection in current buffer #34162', function()
+      insert('foo bar baz')
+      feed('gg0fbvtb')
+      local text = exec_lua([[
+        return vim.api.nvim_buf_call(0, function()
+          return vim.fn.getregion(vim.fn.getpos('.'), vim.fn.getpos('v'))
+        end)
+      ]])
+      eq({ 'bar ' }, text)
+    end)
+  end)
+end)
+
+describe('path sep in ffname/sfname #39382,', function()
+  if not t.is_os('win') then
+    return
+  end
+
+  local cwd, files = vim.uv.cwd(), {}
+  local expected_cwd = vim.fs.normalize(cwd)
+  for i = 1, 3 do
+    files[i] = ([[%s\Xtest\file%s]]):format(cwd, i)
+  end
+
+  local sfname_eq = function(expected, nr)
+    command(('buffer %s'):format(nr or ''))
+    eq(expected, api.nvim_eval_statusline('%f', {}).str)
+  end
+
+  setup(function()
+    t.mkdir('Xtest')
+  end)
+
+  teardown(function()
+    n.rmdir('Xtest')
+  end)
+
+  before_each(function()
+    clear()
+  end)
+
+  it('normalizes startup file arguments', function()
+    clear { args = files }
+    for i = 1, 3 do
+      eq(('%s/Xtest/file%s'):format(expected_cwd, i), api.nvim_buf_get_name(i))
+      sfname_eq(('Xtest/file%s'):format(i), i)
+    end
+  end)
+
+  it('normalizes :next arguments (FILES flag)', function()
+    command(('next %s'):format(table.concat(files, ' ')))
+    for i = 1, 3 do
+      eq(('%s/Xtest/file%s'):format(expected_cwd, i), api.nvim_buf_get_name(i))
+      sfname_eq(('%s/Xtest/file%s'):format(expected_cwd, i), i)
+    end
+  end)
+
+  it('normalizes :edit arguments (FILE1 flag)', function()
+    -- tilde prefix
+    command([[edit ~\foo\bar]])
+    eq(('%s/foo/bar'):format(fn.getenv('HOME')), api.nvim_buf_get_name(0))
+    sfname_eq('~/foo/bar')
+
+    -- absolute path
+    command(('edit %s'):format(files[1]))
+    eq(('%s/Xtest/file1'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq(('%s/Xtest/file1'):format(expected_cwd))
+  end)
+
+  it('normalizes bufadd() arguments', function()
+    local n = fn.bufadd(files[1])
+    eq(('%s/Xtest/file1'):format(expected_cwd), api.nvim_buf_get_name(n))
+    sfname_eq(('%s/Xtest/file1'):format(expected_cwd), n)
+  end)
+
+  it('normalizes bufnr() arguments', function()
+    local n = fn.bufnr(files[1], 1)
+    eq(('%s/Xtest/file1'):format(expected_cwd), api.nvim_buf_get_name(n))
+    sfname_eq(('%s/Xtest/file1'):format(expected_cwd), n)
+  end)
+
+  it('normalizes temp paths, <afile> and <amatch> for :diffpatch', function()
+    t.write_file('Xtest/patch', [[diff file]])
+    t.write_file('Xtest/test.txt', [[input file]])
+    command('edit Xtest/test.txt')
+    exec([[
+      fun MyPatch()
+        call writefile(['output file'], v:fname_out)
+      endfunc
+      set patchexpr=MyPatch()
+    ]])
+    exec_lua([[
+      vim.api.nvim_create_autocmd('BufAdd', {
+        pattern = '*',
+        callback = function(ev)
+          vim.g.test_file = ev.file
+          vim.g.test_match = ev.match
+        end
+      })
+    ]])
+    command('diffpatch Xtest/patch')
+    eq(('%s/Xtest/test.txt.new'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq('Xtest/test.txt.new')
+    local tmp = fn.getenv('TMPDIR')
+    local afile = fn.eval('g:test_file') ---@type string
+    local amatch = fn.eval('g:test_match') ---@type string
+    t.matches(tmp, afile, true)
+    t.not_matches('\\', afile, true)
+    t.matches(tmp, amatch, true)
+    t.not_matches('\\', amatch, true)
+  end)
+
+  it('normalizes :find results', function()
+    t.write_file('Xtest/file1', '')
+    command([[find Xtest\file1]])
+    eq(('%s/Xtest/file1'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq('Xtest/file1')
+
+    -- 'findfunc'
+    exec(([[
+      func FindFile(cmdarg, cmdcomplete)
+        return  ['%s']
+      endfunc
+      set findfunc=FindFile
+    ]]):format(files[2]))
+    command([[find file2]])
+    eq(('%s/Xtest/file2'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq(('%s/Xtest/file2'):format(expected_cwd))
+  end)
+
+  it('normalizes :scriptnames arguments', function()
+    command(('scriptnames %s'):format(files[1]))
+    eq(('%s/Xtest/file1'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq(('%s/Xtest/file1'):format(expected_cwd))
+  end)
+
+  it('normalizes gf targets', function()
+    t.write_file('Xtest/file1', '')
+    feed(('i%s<Esc>0gf'):format(files[1]))
+    eq(('%s/Xtest/file1'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq(('%s/Xtest/file1'):format(expected_cwd))
+    command('bw')
+    feed('<C-W>f')
+    eq(('%s/Xtest/file1'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq(('%s/Xtest/file1'):format(expected_cwd))
+  end)
+
+  it('normalizes macro definition targets and completions', function()
+    t.mkdir('Xtest/sub')
+    t.write_file(
+      'Xtest/sub/bar.h',
+      [[
+      #define MIN 0;
+      #define MAX 10;
+    ]]
+    )
+    t.write_file(
+      'Xtest/foo.c',
+      [[
+      #include "sub\bar.h";
+      void main() {
+        int i = MIN;
+      }
+    ]]
+    )
+    local screen = Screen.new(30, 10)
+    command([[set include=^\\s*#\\s*include]])
+    command([[set define=^\\s*#\\s*define]])
+    command('e Xtest/foo.c')
+    command('djump MIN')
+    eq(('%s/Xtest/sub/bar.h'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq('Xtest/sub/bar.h')
+    command('bw')
+    feed('/MIN<CR>lxxi<C-x><C-d>')
+    screen:expect({
+      any = {
+        'MIN Xtest/sub/bar.h',
+        'MAX Xtest/sub/bar.h',
+      },
+    })
+  end)
+
+  it('normalizes tag targets', function()
+    t.write_file(
+      'Xtest/tags',
+      [[
+      main	.\\foo.c	/^void main() /;"	f	typeref:typename:void
+      main2	$DIR\foo.c	/^void main2() /;"	f	typeref:typename:void
+      main3	./foo.c	/^void main3() /;"	f	typeref:typename:void
+    ]]
+    )
+    t.write_file(
+      'Xtest/foo.c',
+      [[
+      void main() {}
+      void main2() {};
+      void main3() {};
+    ]]
+    )
+
+    command('cd Xtest')
+    command('tjump main')
+    eq(('%s/Xtest/foo.c'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq('.//foo.c')
+
+    command('bw')
+    fn.setenv('DIR', ([[%s\Xtest]]):format(cwd))
+    command('tjump main2')
+    eq(('%s/Xtest/foo.c'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq(('%s/Xtest/foo.c'):format(expected_cwd))
+
+    command('bw')
+    command('tjump main3')
+    eq(('%s/Xtest/foo.c'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq('./foo.c')
+  end)
+
+  it('normalizes quickfix targets', function()
+    t.write_file(
+      'Xtest/error',
+      [[
+      foo.c
+      .\Xtest\foo.c(3): error C2143: syntax error: missing ';' before 'return'
+    ]]
+    )
+    local screen = Screen.new(40, 10)
+    command('cg Xtest/error')
+    command('copen')
+    screen:expect({
+      any = './Xtest/foo.c',
+    })
+    feed('<CR>')
+    eq(('%s/Xtest/foo.c'):format(expected_cwd), api.nvim_buf_get_name(0))
+    sfname_eq('./Xtest/foo.c')
+  end)
+
+  it('preserves backslashes in URIs', function()
+    local exe_path = fn.exepath('cmd')
+    t.not_matches('/', exe_path, true)
+    command(('e term://%s'):format(exe_path))
+    t.matches(exe_path, api.nvim_buf_get_name(0), true)
+    t.matches(exe_path, api.nvim_eval_statusline('%f', {}).str, true)
+  end)
+end)
